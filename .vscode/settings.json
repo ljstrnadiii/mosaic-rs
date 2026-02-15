@@ -1,0 +1,12 @@
+{
+  "rust-analyzer.cargo.features": [
+    "proj",
+    "object_store",
+    "geoparquet"
+  ],
+  "rust-analyzer.check.features": [
+    "proj",
+    "object_store",
+    "geoparquet"
+  ]
+}

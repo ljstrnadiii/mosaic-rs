@@ -11,6 +11,8 @@ proj = ["dep:proj", "warp-rs/proj"]
 object_store = ["async-tiff/object_store"]
 # Optional GeoParquet loading via Arrow2 + WKB decoding.
 geoparquet = ["dep:arrow2", "dep:wkb", "dep:geozero"]
+# Optional Perfetto/Chrome trace export via tracing.
+perfetto = ["dep:tracing-chrome"]
 
 [dependencies]
 warp-rs = { path = "../warp-rs", default-features = false }
@@ -31,5 +33,6 @@ anyhow = "1.0"
 arrow2 = { version = "0.17", optional = true, features = ["io_parquet", "io_parquet_compression"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"], default-features = false }
+tracing-chrome = { version = "0.7", optional = true }
 url = "2.5"
 lru = "0.12"

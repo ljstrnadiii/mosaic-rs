@@ -2,11 +2,13 @@
   "rust-analyzer.cargo.features": [
     "proj",
     "object_store",
-    "geoparquet"
+    "geoparquet",
+    "perfetto"
   ],
   "rust-analyzer.check.features": [
     "proj",
     "object_store",
-    "geoparquet"
+    "geoparquet",
+    "perfetto"
   ]
 }

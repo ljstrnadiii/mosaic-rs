@@ -1,24 +1,22 @@
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
+use async_tiff::ImageFileDirectory;
 use async_tiff::decoder::DecoderRegistry;
 use async_tiff::metadata::TiffMetadataReader;
 use async_tiff::metadata::cache::ReadaheadMetadataCache;
 use async_tiff::reader::{AsyncFileReader, ObjectReader};
-use async_tiff::{ImageFileDirectory, TIFF};
-use lru::LruCache;
 use object_store::ObjectStore;
 use object_store::path::Path;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
+use tracing::Instrument;
 use url::Url;
 use warp_rs::{GridSpec, PixelWindow, RasterLayout, RasterOwned, SourceTileLayout, SourceTiling};
 
+use crate::cache::ByteLruCache;
 use crate::types::{GtiError, Result, TileMeta};
 
 pub struct TileHandle {
     pub uri: String,
-    pub tiff: TIFF,
     pub ifd: ImageFileDirectory,
     pub reader: Arc<dyn AsyncFileReader>,
     pub layout: RasterLayout,
@@ -28,6 +26,7 @@ pub struct TileHandle {
 }
 
 /// Open a tile lazily using a caller-provided `ObjectStore`.
+#[tracing::instrument(name = "tile.open", skip(store), fields(uri = %uri))]
 pub async fn open_tile(uri: &str, store: Arc<dyn ObjectStore>) -> Result<TileHandle> {
     tracing::info!(target: "mosaic", uri, "open_tile: start");
     let url = Url::parse(uri).map_err(|e| GtiError::IndexLoad(format!("bad url {uri}: {e}")))?;
@@ -39,17 +38,14 @@ pub async fn open_tile(uri: &str, store: Arc<dyn ObjectStore>) -> Result<TileHan
     // Metadata with small readahead.
     let cache = ReadaheadMetadataCache::new(reader.clone());
     let mut meta = TiffMetadataReader::try_open(&cache)
+        .instrument(tracing::debug_span!("async_tiff.read_metadata"))
         .await
         .map_err(|e| GtiError::IndexLoad(e.to_string()))?;
-    let ifds = meta
-        .read_all_ifds(&cache)
+    let ifd = meta
+        .read_next_ifd(&cache)
+        .instrument(tracing::debug_span!("async_tiff.read_next_ifd"))
         .await
-        .map_err(|e| GtiError::IndexLoad(e.to_string()))?;
-    let tiff = TIFF::new(ifds, meta.endianness());
-    let ifd = tiff
-        .ifds()
-        .first()
-        .cloned()
+        .map_err(|e| GtiError::IndexLoad(e.to_string()))?
         .ok_or_else(|| GtiError::IndexLoad("no IFDs in TIFF".into()))?;
 
     let (affine, crs) = build_affine_and_crs(&ifd)?;
@@ -67,7 +63,6 @@ pub async fn open_tile(uri: &str, store: Arc<dyn ObjectStore>) -> Result<TileHan
 
     Ok(TileHandle {
         uri: uri.to_string(),
-        tiff,
         ifd,
         reader,
         layout,
@@ -99,64 +94,45 @@ pub fn tile_meta_from_handle(handle: &TileHandle, dst_crs: &str) -> Result<TileM
     })
 }
 
-/// Read full raster into f32 RasterOwned.
-pub async fn read_full_raster_f32(handle: &TileHandle) -> Result<RasterOwned> {
-    tracing::info!(
-        target: "mosaic",
-        uri = %handle.uri,
-        width = handle.ifd.image_width(),
-        height = handle.ifd.image_height(),
-        bands = handle.ifd.samples_per_pixel(),
-        "decode_tile: start full read"
-    );
-    let width = handle.ifd.image_width() as usize;
-    let height = handle.ifd.image_height() as usize;
-    let bands = handle.ifd.samples_per_pixel() as usize;
-    let mut out = RasterOwned::from_filled_with_layout(
-        width,
-        height,
-        bands,
-        handle.nodata.unwrap_or(f32::NAN),
-        handle.layout,
-    );
-
-    let decoder = DecoderRegistry::default();
-    let (tiles_x, tiles_y) = handle.ifd.tile_count().unwrap_or((1, 1)); // strips treated as 1xN
-
-    for ty in 0..tiles_y {
-        for tx in 0..tiles_x {
-            let tile = handle
-                .ifd
-                .fetch_tile(tx, ty, handle.reader.as_ref())
-                .await
-                .map_err(|e| GtiError::IndexLoad(e.to_string()))?;
-            let arr = tile
-                .decode(&decoder)
-                .map_err(|e| GtiError::IndexLoad(e.to_string()))?;
-            let layout_planar = matches!(handle.layout, RasterLayout::Planar);
-            write_tile_into_raster(&arr, tx, ty, layout_planar, &mut out);
-        }
-    }
-
-    Ok(out)
-}
-
 /// Read just the requested pixel window into a RasterOwned.
-pub type PixelCache = Arc<Mutex<LruCache<WindowKey, Arc<CachedWindow>>>>;
+pub type PixelCache = Arc<Mutex<ByteLruCache<WindowKey, Arc<CachedWindow>>>>;
 
+#[tracing::instrument(
+    name = "read_window_raster_f32",
+    skip(handle, pixel_cache),
+    fields(uri = uri, src_x = window.x, src_y = window.y, src_w = window.width, src_h = window.height)
+)]
 pub async fn read_window_raster_f32(
     handle: &TileHandle,
     window: PixelWindow,
     uri: &str,
     pixel_cache: Option<&PixelCache>,
+    cpu_sem: &Arc<Semaphore>,
 ) -> Result<(RasterOwned, GridSpec)> {
     // Check cache first.
     if let Some(cache) = pixel_cache {
         let key = WindowKey::new(uri, window);
-        if let Some(entry) = cache.lock().await.get(&key) {
-            let cached = entry.clone();
-            return Ok((cached.raster.as_ref().clone(), cached.grid.clone()));
+        if let Some(entry) = cache.lock().await.get_cloned(&key) {
+            tracing::debug!(
+                target: "mosaic",
+                uri = uri,
+                src_x = window.x,
+                src_y = window.y,
+                src_w = window.width,
+                src_h = window.height,
+                "pixel cache hit"
+            );
+            return Ok((entry.raster.as_ref().clone(), entry.grid.clone()));
         }
+        tracing::debug!(
+            target: "mosaic",
+            uri = uri,
+            src_x = window.x,
+            src_y = window.y,
+            src_w = window.width,
+            src_h = window.height,
+            "pixel cache miss"
+        );
     }
 
     let width = handle.ifd.image_width() as usize;
@@ -174,15 +150,6 @@ pub async fn read_window_raster_f32(
         },
     );
 
-    let mut out = RasterOwned::from_filled_with_layout(
-        window.width,
-        window.height,
-        bands,
-        handle.nodata.unwrap_or(f32::NAN),
-        handle.layout,
-    );
-
-    let decoder = DecoderRegistry::default();
     let tile_w = tiling.tile_width;
     let tile_h = tiling.tile_height;
     let tx0 = window.x / tile_w;
@@ -200,25 +167,55 @@ pub async fn read_window_raster_f32(
     let tiles = handle
         .ifd
         .fetch_tiles(&xy, handle.reader.as_ref())
+        .instrument(tracing::debug_span!(
+            "async_tiff.fetch_tiles",
+            count = xy.len()
+        ))
         .await
         .map_err(|e| GtiError::IndexLoad(e.to_string()))?;
 
-    for tile in tiles {
-        let tx = tile.x();
-        let ty = tile.y();
-        let arr = tile
-            .decode(&decoder)
-            .map_err(|e| GtiError::IndexLoad(e.to_string()))?;
-        let layout_planar = matches!(handle.layout, RasterLayout::Planar);
-        write_tile_into_window(
-            &arr,
-            tx * tile_w,
-            ty * tile_h,
-            layout_planar,
-            window,
-            &mut out,
+    let layout = handle.layout;
+    let nodata = handle.nodata.unwrap_or(f32::NAN);
+    let permit = cpu_sem
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|e| GtiError::IndexLoad(e.to_string()))?;
+    let decode_span = tracing::debug_span!("async_tiff.decode_window");
+    let out = tokio::task::spawn_blocking(move || {
+        let _span = decode_span.enter();
+        let mut out = RasterOwned::from_filled_with_layout(
+            window.width,
+            window.height,
+            bands,
+            nodata,
+            layout,
         );
-    }
+        let decoder = DecoderRegistry::default();
+        let layout_planar = matches!(layout, RasterLayout::Planar);
+
+        for tile in tiles {
+            let tx = tile.x();
+            let ty = tile.y();
+            let _span = tracing::trace_span!("async_tiff.decode_tile", tx = tx, ty = ty).entered();
+            let arr = tile
+                .decode(&decoder)
+                .map_err(|e| GtiError::IndexLoad(e.to_string()))?;
+            write_tile_into_window(
+                &arr,
+                tx * tile_w,
+                ty * tile_h,
+                layout_planar,
+                window,
+                &mut out,
+            );
+        }
+
+        Ok::<_, GtiError>(out)
+    })
+    .await
+    .map_err(|e| GtiError::IndexLoad(e.to_string()))??;
+    drop(permit);
 
     // Build sub-grid aligned to the window.
     let mut affine = handle.src_grid.affine;
@@ -248,74 +245,26 @@ pub async fn read_window_raster_f32(
             raster: Arc::new(out.clone()),
             grid: sub_grid.clone(),
         });
+        let bytes = out
+            .data()
+            .len()
+            .saturating_mul(std::mem::size_of::<f32>())
+            .max(1);
         let mut guard = cache.lock().await;
-        guard.put(key, entry);
+        guard.put(key, entry, bytes);
+        tracing::debug!(
+            target: "mosaic",
+            uri = uri,
+            src_x = window.x,
+            src_y = window.y,
+            src_w = window.width,
+            src_h = window.height,
+            bytes = bytes,
+            "pixel cache insert"
+        );
     }
 
     Ok((out, sub_grid))
-}
-
-fn write_tile_into_raster(
-    arr: &async_tiff::Array,
-    tx: usize,
-    ty: usize,
-    layout_planar: bool,
-    out: &mut RasterOwned,
-) {
-    let shape = arr.shape();
-    // Derive dims based on planar flag
-    let (tile_h, tile_w, band_count) = if layout_planar {
-        (shape[1], shape[2], shape[0])
-    } else {
-        (shape[0], shape[1], shape[2])
-    };
-    let x0 = tx * tile_w;
-    let y0 = ty * tile_h;
-
-    for b in 0..band_count {
-        for dy in 0..tile_h {
-            let sy = dy;
-            let dy_out = y0 + dy;
-            if dy_out >= out.height() {
-                continue;
-            }
-            for dx in 0..tile_w {
-                let sx = dx;
-                let dx_out = x0 + dx;
-                if dx_out >= out.width() {
-                    continue;
-                }
-                let src_idx = if layout_planar {
-                    // planar: [band][y][x]
-                    b * (tile_h * tile_w) + sy * tile_w + sx
-                } else {
-                    // chunky: [y][x][band]
-                    (sy * tile_w + sx) * band_count + b
-                };
-                let val = match arr.data() {
-                    async_tiff::TypedArray::UInt8(v) => v[src_idx] as f32,
-                    async_tiff::TypedArray::UInt16(v) => v[src_idx] as f32,
-                    async_tiff::TypedArray::UInt32(v) => v[src_idx] as f32,
-                    async_tiff::TypedArray::Int8(v) => v[src_idx] as f32,
-                    async_tiff::TypedArray::Int16(v) => v[src_idx] as f32,
-                    async_tiff::TypedArray::Int32(v) => v[src_idx] as f32,
-                    async_tiff::TypedArray::UInt64(v) => v[src_idx] as f32,
-                    async_tiff::TypedArray::Int64(v) => v[src_idx] as f32,
-                    async_tiff::TypedArray::Float32(v) => v[src_idx],
-                    async_tiff::TypedArray::Float64(v) => v[src_idx] as f32,
-                    async_tiff::TypedArray::Bool(v) => {
-                        if v[src_idx] {
-                            1.0
-                        } else {
-                            0.0
-                        }
-                    }
-                };
-                let dst_idx = out.index(dx_out, dy_out, b);
-                out.data_mut()[dst_idx] = val;
-            }
-        }
-    }
 }
 
 fn write_tile_into_window(

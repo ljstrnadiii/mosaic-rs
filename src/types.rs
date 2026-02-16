@@ -220,20 +220,20 @@ pub struct TileMeta {
 pub struct BuildOptions {
     pub tokio_handle: Option<tokio::runtime::Handle>,
     pub object_store: std::sync::Arc<dyn object_store::ObjectStore>,
-    /// Max number of tiles to process concurrently.
+    /// Max number of destination blocks to process concurrently.
     pub max_tile_concurrency: usize,
-    /// Max number of work items (window fetch + decode + reproject) per tile to run concurrently.
+    /// Max number of CPU-side decode/reproject tasks to run concurrently.
     pub max_work_concurrency: usize,
     /// Optional cache configuration (if None, no caching).
     pub cache: Option<CacheConfig>,
-    /// Optional cap on how many tiles (in sorted/z-order) are allowed to contribute.
+    /// Optional cap on how many overlapping tiles (in sorted/z-order) are evaluated per output block.
     pub z_limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct CacheConfig {
-    /// Entries in the metadata cache (TileHandle)
-    pub meta_capacity: usize,
-    /// Entries in the pixel cache (windowed decode results)
-    pub pixel_capacity: usize,
+    /// Metadata cache budget in bytes.
+    pub meta_max_bytes: usize,
+    /// Pixel-window cache budget in bytes.
+    pub pixel_max_bytes: usize,
 }

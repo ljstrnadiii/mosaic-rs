@@ -55,6 +55,11 @@ pub fn blit_block(
 }
 
 fn is_nodata(value: f32, nodata: f32) -> bool {
+    // Treat NaN as nodata regardless of configured sentinel. Reprojection can
+    // generate NaNs at tile/window edges even when output_nodata is finite.
+    if value.is_nan() {
+        return true;
+    }
     if nodata.is_nan() {
         value.is_nan()
     } else {

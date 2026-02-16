@@ -10,6 +10,8 @@ use std::fs::read_to_string;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(feature = "perfetto")]
+use tracing_subscriber::prelude::*;
 use url::Url;
 use warp_rs::GridSpec;
 
@@ -17,21 +19,18 @@ use warp_rs::GridSpec;
 /// build a small output window (1024x1024), and ensure the pipeline runs.
 #[test]
 fn build_small_window_from_geoparquet_subset() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_test_writer()
-        .try_init();
+    let _perfetto_guard = init_tracing();
 
     // Load full index (assumed to fit in memory for test).
     let tiles = load_tiles_from_geoparquet("index.parquet", "geometry", "url", None, None)
         .expect("load tiles");
     assert!(!tiles.is_empty());
 
-    // 5x5 mile box around Boulder, CO (~40.014984, -105.270546) in EPSG:4326.
-    let center_lat = 40.014984_f64;
-    let center_lon = -105.270546_f64;
-    let half_width_deg = 0.1; // ~5 miles east-west at this latitude
-    let half_height_deg = 0.1; // ~5 miles north-south
+    // box around Denver, CO intersecting 4 tiles in the index in EPSG:4326.
+    let center_lat = 39.7085_f64;
+    let center_lon = -104.9402_f64;
+    let half_width_deg = 0.6;
+    let half_height_deg = 0.6;
     let bbox = BBox::new(
         center_lon - half_width_deg,
         center_lat - half_height_deg,
@@ -39,7 +38,7 @@ fn build_small_window_from_geoparquet_subset() {
         center_lat + half_height_deg,
     );
     println!(
-        "using bbox around Boulder: min=({:.6},{:.6}) max=({:.6},{:.6}), tiles={}",
+        "using bbox around Denver: min=({:.6},{:.6}) max=({:.6},{:.6}), tiles={}",
         bbox.minx,
         bbox.miny,
         bbox.maxx,
@@ -92,13 +91,13 @@ fn build_small_window_from_geoparquet_subset() {
     let opts = BuildOptions {
         tokio_handle: None,
         object_store: Arc::new(store),
-        max_tile_concurrency: 4,
+        max_tile_concurrency: 8,
         max_work_concurrency: 8,
         cache: Some(mosaic_index::CacheConfig {
-            meta_capacity: 32,
-            pixel_capacity: 64,
+            meta_max_bytes: 1 * 1024 * 1024 * 1024,
+            pixel_max_bytes: 5 * 1024 * 1024 * 1024,
         }),
-        z_limit: Some(1),
+        z_limit: None,
     };
 
     let result = build_mosaic(&spec, tiles, opts);
@@ -120,6 +119,45 @@ fn build_small_window_from_geoparquet_subset() {
         write_geotiff_f32(out_path, &raster, &dst_grid, spec.output_nodata).expect("write geotiff");
         println!("wrote {} for inspection", out_path);
     }
+}
+
+#[cfg(feature = "perfetto")]
+fn init_tracing() -> Option<tracing_chrome::FlushGuard> {
+    let env_filter = tracing_subscriber::EnvFilter::from_default_env();
+    let fmt_layer = tracing_subscriber::fmt::layer().with_test_writer();
+    if let Ok(path) = env::var("PERFETTO_TRACE") {
+        let trace_path = if path.trim().is_empty() {
+            "/tmp/mosaic.perfetto.json".to_string()
+        } else {
+            path
+        };
+        let (chrome_layer, guard) = tracing_chrome::ChromeLayerBuilder::new()
+            .file(trace_path.clone())
+            .include_args(true)
+            .build();
+        let _ = tracing_subscriber::registry()
+            .with(env_filter)
+            .with(fmt_layer)
+            .with(chrome_layer)
+            .try_init();
+        eprintln!("perfetto trace enabled: {}", trace_path);
+        Some(guard)
+    } else {
+        let _ = tracing_subscriber::registry()
+            .with(env_filter)
+            .with(fmt_layer)
+            .try_init();
+        None
+    }
+}
+
+#[cfg(not(feature = "perfetto"))]
+fn init_tracing() -> Option<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+    None
 }
 
 fn aws_credentials_from_env_or_profile() -> Option<(String, String, Option<String>)> {
@@ -228,6 +266,9 @@ fn band0_stats(raster: &mosaic_index::RasterOwned, nodata: f32) -> (usize, f32, 
 }
 
 fn is_nodata(value: f32, nodata: f32) -> bool {
+    if value.is_nan() {
+        return true;
+    }
     if nodata.is_nan() {
         value.is_nan()
     } else {

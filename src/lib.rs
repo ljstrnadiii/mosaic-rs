@@ -20,8 +20,6 @@ pub use types::{
     SortValue, TileRecord,
 };
 
-#[cfg(feature = "geoparquet")]
-pub use index::load_tiles_from_geoparquet;
 pub use warp_rs::{IdentityTransform, RasterOwned, Resample};
 
 type MetaCache = Arc<Mutex<cache::ByteLruCache<String, Arc<io::TileHandle>>>>;

@@ -1,0 +1,25 @@
+[package]
+name = "py-mosaic-index"
+version = "0.1.0"
+edition = "2024"
+description = "Python bindings for mosaic-index"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "_mosaic_index"
+crate-type = ["cdylib"]
+
+[features]
+extension-module = ["pyo3/extension-module"]
+abi3-py311 = ["pyo3/abi3-py311"]
+
+[dependencies]
+chrono = "0.4"
+geo = "0.28"
+mosaic-index = { path = "..", features = ["perfetto"] }
+pyo3 = { version = "0.27", features = ["macros", "chrono"] }
+pyo3-async-runtimes = "0.27"
+pyo3-object_store = "0.8.0"
+tracing = "0.1"
+tracing-chrome = "0.7"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"], default-features = false }

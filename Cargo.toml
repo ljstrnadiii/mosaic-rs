@@ -9,8 +9,6 @@ default = ["proj", "object_store"]
 proj = ["dep:proj", "warp-rs/proj"]
 # Enable object_store-backed I/O in async-tiff.
 object_store = ["async-tiff/object_store"]
-# Optional GeoParquet loading via Arrow2 + WKB decoding.
-geoparquet = ["dep:arrow2", "dep:wkb", "dep:geozero"]
 # Optional Perfetto/Chrome trace export via tracing.
 perfetto = ["dep:tracing-chrome"]
 
@@ -25,12 +23,8 @@ tokio = { version = "1.43", features = ["rt-multi-thread", "sync"] }
 thiserror = "2.0"
 futures = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-polars = { version = "0.41.3", optional = true, default-features = false, features = ["lazy", "parquet"] }
-wkb = { version = "0.9.2", optional = true }
-geozero = { version = "0.13.0", optional = true, default-features = false, features = ["with-geo", "with-wkb"] }
 object_store = { version = "0.13", features = ["aws"] }
 anyhow = "1.0"
-arrow2 = { version = "0.17", optional = true, features = ["io_parquet", "io_parquet_compression"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"], default-features = false }
 tracing-chrome = { version = "0.7", optional = true }

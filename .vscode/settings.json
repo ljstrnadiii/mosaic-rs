@@ -1,14 +1,14 @@
 {
+  "python.defaultInterpreterPath": "${workspaceFolder}/python/.venv/bin/python",
+  "python.terminal.activateEnvironment": true,
   "rust-analyzer.cargo.features": [
     "proj",
     "object_store",
-    "geoparquet",
     "perfetto"
   ],
   "rust-analyzer.check.features": [
     "proj",
     "object_store",
-    "geoparquet",
     "perfetto"
   ]
 }

@@ -1,6 +1,7 @@
 # mosaic-index
 
-`mosaic-index` is a Rust crate for building output mosaics from an indexed set of source GeoTIFF/COG tiles.
+`mosaic-index` is a Rust crate for building output mosaics from an indexed set of source GeoTIFF/COG 
+tiles with inspiration taken from GDAL's GTI driver.
 
 It combines:
 - tile indexing and ordering,
@@ -8,6 +9,9 @@ It combines:
 - `warp-rs` reprojection,
 - block-wise compositing,
 - optional caching and perf/debug instrumentation.
+
+**Note**: This is a project used to both learn more about GTI driver and rust is not intended to be
+a production grade product.
 
 ## Core API
 
@@ -91,3 +95,8 @@ let raster = build_mosaic(&spec, tiles, opts)?;
 - Output type is `warp_rs::RasterOwned`.
 - Source reads are windowed; only needed TIFF tiles are fetched.
 - Pixel cache stores decoded source tiles keyed by `(uri, tile_x, tile_y)` to avoid repeated decode work across overlapping windows.
+
+
+## TODO
+1. drop z_limit
+2. 

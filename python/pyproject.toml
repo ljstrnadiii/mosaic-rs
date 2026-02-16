@@ -1,0 +1,29 @@
+[build-system]
+requires = ["maturin>=1.4.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "mosaic-index"
+requires-python = ">=3.10"
+description = "Python bindings for the mosaic-index Rust crate"
+readme = "README.md"
+dependencies = ["obstore>=0.8.2"]
+dynamic = ["version"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: Implementation :: PyPy",
+]
+
+[dependency-groups]
+dev = [
+    "geopandas>=1.0",
+    "numpy>=2.0",
+    "pyarrow>=16.0",
+    "rasterio>=1.4",
+]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "mosaic_index._mosaic_index"
+python-source = "python"

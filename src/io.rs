@@ -1,19 +1,25 @@
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use async_tiff::ImageFileDirectory;
 use async_tiff::decoder::DecoderRegistry;
 use async_tiff::metadata::TiffMetadataReader;
 use async_tiff::metadata::cache::ReadaheadMetadataCache;
 use async_tiff::reader::{AsyncFileReader, ObjectReader};
+use async_tiff::{CompressedBytes, ImageFileDirectory, Tile};
 use object_store::ObjectStore;
 use object_store::path::Path;
+use rayon::prelude::*;
 use tokio::sync::{Mutex, Semaphore};
 use tracing::Instrument;
 use url::Url;
 use warp_rs::{GridSpec, PixelWindow, RasterLayout, RasterOwned, SourceTileLayout, SourceTiling};
 
 use crate::cache::ByteLruCache;
-use crate::types::{GtiError, Result, TileMeta};
+use crate::types::{
+    DebugWindow, FetchTilesDebugCall, FetchTilesDebugLog, GtiError, PerfStats, PerfStatsSink,
+    Result, TileMeta,
+};
 
 pub struct TileHandle {
     pub uri: String,
@@ -95,11 +101,27 @@ pub fn tile_meta_from_handle(handle: &TileHandle, dst_crs: &str) -> Result<TileM
 }
 
 /// Read just the requested pixel window into a RasterOwned.
-pub type PixelCache = Arc<Mutex<ByteLruCache<WindowKey, Arc<CachedWindow>>>>;
+pub type PixelCache = Arc<Mutex<ByteLruCache<SourceTileKey, Arc<async_tiff::Array>>>>;
+pub type TileFetchGuards = Arc<Mutex<HashMap<SourceTileKey, Arc<Mutex<()>>>>>;
+
+enum WindowTileInput {
+    Decoded {
+        tx: usize,
+        ty: usize,
+        arr: Arc<async_tiff::Array>,
+    },
+    Encoded(Tile),
+}
 
 #[tracing::instrument(
     name = "read_window_raster_f32",
-    skip(handle, pixel_cache),
+    skip(
+        handle,
+        pixel_cache,
+        tile_fetch_guards,
+        fetch_tiles_debug_log,
+        perf_stats
+    ),
     fields(uri = uri, src_x = window.x, src_y = window.y, src_w = window.width, src_h = window.height)
 )]
 pub async fn read_window_raster_f32(
@@ -107,34 +129,11 @@ pub async fn read_window_raster_f32(
     window: PixelWindow,
     uri: &str,
     pixel_cache: Option<&PixelCache>,
+    tile_fetch_guards: Option<&TileFetchGuards>,
+    fetch_tiles_debug_log: Option<&FetchTilesDebugLog>,
+    perf_stats: Option<&PerfStatsSink>,
     cpu_sem: &Arc<Semaphore>,
 ) -> Result<(RasterOwned, GridSpec)> {
-    // Check cache first.
-    if let Some(cache) = pixel_cache {
-        let key = WindowKey::new(uri, window);
-        if let Some(entry) = cache.lock().await.get_cloned(&key) {
-            tracing::debug!(
-                target: "mosaic",
-                uri = uri,
-                src_x = window.x,
-                src_y = window.y,
-                src_w = window.width,
-                src_h = window.height,
-                "pixel cache hit"
-            );
-            return Ok((entry.raster.as_ref().clone(), entry.grid.clone()));
-        }
-        tracing::debug!(
-            target: "mosaic",
-            uri = uri,
-            src_x = window.x,
-            src_y = window.y,
-            src_w = window.width,
-            src_h = window.height,
-            "pixel cache miss"
-        );
-    }
-
     let width = handle.ifd.image_width() as usize;
     let height = handle.ifd.image_height() as usize;
     let bands = handle.ifd.samples_per_pixel() as usize;
@@ -163,16 +162,124 @@ pub async fn read_window_raster_f32(
             xy.push((tx, ty));
         }
     }
+    let debug_window = DebugWindow {
+        x: window.x,
+        y: window.y,
+        width: window.width,
+        height: window.height,
+    };
 
-    let tiles = handle
-        .ifd
-        .fetch_tiles(&xy, handle.reader.as_ref())
-        .instrument(tracing::debug_span!(
-            "async_tiff.fetch_tiles",
-            count = xy.len()
-        ))
-        .await
-        .map_err(|e| GtiError::IndexLoad(e.to_string()))?;
+    let (tiles, held_key_guards) = if let Some(cache) = pixel_cache {
+        let mut tiles: Vec<WindowTileInput> = Vec::with_capacity(xy.len());
+        let mut misses = Vec::new();
+        {
+            let mut guard = cache.lock().await;
+            for &(tx, ty) in &xy {
+                let key = SourceTileKey::new(uri, tx, ty);
+                if let Some(arr) = guard.get_cloned(&key) {
+                    tiles.push(WindowTileInput::Decoded { tx, ty, arr });
+                } else {
+                    misses.push((tx, ty));
+                }
+            }
+        }
+
+        tracing::debug!(
+            target: "mosaic",
+            uri = uri,
+            src_x = window.x,
+            src_y = window.y,
+            src_w = window.width,
+            src_h = window.height,
+            tile_count = xy.len(),
+            tile_hits = tiles.len(),
+            tile_misses = misses.len(),
+            "decoded tile cache lookup"
+        );
+
+        let mut held_key_guards = None;
+        if !misses.is_empty() {
+            let mut still_missing = misses.clone();
+
+            if let Some(fetch_guards) = tile_fetch_guards {
+                let mut miss_keys = misses
+                    .iter()
+                    .map(|(tx, ty)| SourceTileKey::new(uri, *tx, *ty))
+                    .collect::<Vec<_>>();
+                miss_keys.sort();
+                miss_keys.dedup();
+
+                let key_guards = {
+                    let mut guard_map = fetch_guards.lock().await;
+                    miss_keys
+                        .iter()
+                        .map(|key| {
+                            guard_map
+                                .entry(key.clone())
+                                .or_insert_with(|| Arc::new(Mutex::new(())))
+                                .clone()
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let mut local_key_guards = Vec::with_capacity(key_guards.len());
+                for guard in key_guards {
+                    local_key_guards.push(guard.lock_owned().await);
+                }
+                held_key_guards = Some(local_key_guards);
+
+                still_missing.clear();
+                let mut cache_guard = cache.lock().await;
+                for &(tx, ty) in &misses {
+                    let key = SourceTileKey::new(uri, tx, ty);
+                    if let Some(arr) = cache_guard.get_cloned(&key) {
+                        tiles.push(WindowTileInput::Decoded { tx, ty, arr });
+                    } else {
+                        still_missing.push((tx, ty));
+                    }
+                }
+            }
+
+            if !still_missing.is_empty() {
+                let fetched_inputs = still_missing.clone();
+                let fetched_tiles = fetch_tiles_timed(handle, &still_missing, perf_stats).await?;
+                record_fetch_tiles_call(
+                    fetch_tiles_debug_log,
+                    FetchTilesDebugCall {
+                        uri: uri.to_string(),
+                        window: debug_window,
+                        requested_tiles: xy.clone(),
+                        fetched_tiles: fetched_inputs.clone(),
+                        cache_hits: xy.len().saturating_sub(fetched_inputs.len()),
+                        cache_misses: fetched_inputs.len(),
+                    },
+                );
+                tiles.extend(fetched_tiles.into_iter().map(WindowTileInput::Encoded));
+            }
+        }
+
+        (tiles, held_key_guards)
+    } else {
+        let fetched_inputs = xy.clone();
+        let fetched_tiles = fetch_tiles_timed(handle, &xy, perf_stats).await?;
+        record_fetch_tiles_call(
+            fetch_tiles_debug_log,
+            FetchTilesDebugCall {
+                uri: uri.to_string(),
+                window: debug_window,
+                requested_tiles: fetched_inputs.clone(),
+                fetched_tiles: fetched_inputs,
+                cache_hits: 0,
+                cache_misses: xy.len(),
+            },
+        );
+        (
+            fetched_tiles
+                .into_iter()
+                .map(WindowTileInput::Encoded)
+                .collect(),
+            None,
+        )
+    };
 
     let layout = handle.layout;
     let nodata = handle.nodata.unwrap_or(f32::NAN);
@@ -182,7 +289,8 @@ pub async fn read_window_raster_f32(
         .await
         .map_err(|e| GtiError::IndexLoad(e.to_string()))?;
     let decode_span = tracing::debug_span!("async_tiff.decode_window");
-    let out = tokio::task::spawn_blocking(move || {
+    let decode_started = Instant::now();
+    let (out, decoded_tiles) = tokio::task::spawn_blocking(move || {
         let _span = decode_span.enter();
         let mut out = RasterOwned::from_filled_with_layout(
             window.width,
@@ -191,18 +299,53 @@ pub async fn read_window_raster_f32(
             nodata,
             layout,
         );
-        let decoder = DecoderRegistry::default();
         let layout_planar = matches!(layout, RasterLayout::Planar);
+        let mut cached_tiles = Vec::new();
+        let mut encoded_tiles = Vec::new();
 
         for tile in tiles {
-            let tx = tile.x();
-            let ty = tile.y();
-            let _span = tracing::trace_span!("async_tiff.decode_tile", tx = tx, ty = ty).entered();
-            let arr = tile
-                .decode(&decoder)
-                .map_err(|e| GtiError::IndexLoad(e.to_string()))?;
+            match tile {
+                WindowTileInput::Decoded { tx, ty, arr } => cached_tiles.push((tx, ty, arr)),
+                WindowTileInput::Encoded(tile) => encoded_tiles.push(tile),
+            }
+        }
+
+        let decoded_tiles = if encoded_tiles.len() <= 1 {
+            let decoder = DecoderRegistry::default();
+            encoded_tiles
+                .into_iter()
+                .map(|tile| {
+                    let tx = tile.x();
+                    let ty = tile.y();
+                    let _span =
+                        tracing::trace_span!("async_tiff.decode_tile", tx = tx, ty = ty).entered();
+                    let arr = Arc::new(
+                        tile.decode(&decoder)
+                            .map_err(|e| GtiError::IndexLoad(e.to_string()))?,
+                    );
+                    Ok::<_, GtiError>((tx, ty, arr))
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            encoded_tiles
+                .into_par_iter()
+                .map_init(DecoderRegistry::default, |decoder, tile| {
+                    let tx = tile.x();
+                    let ty = tile.y();
+                    let _span =
+                        tracing::trace_span!("async_tiff.decode_tile", tx = tx, ty = ty).entered();
+                    let arr = Arc::new(
+                        tile.decode(decoder)
+                            .map_err(|e| GtiError::IndexLoad(e.to_string()))?,
+                    );
+                    Ok::<_, GtiError>((tx, ty, arr))
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+
+        for (tx, ty, arr) in cached_tiles.iter().chain(decoded_tiles.iter()) {
             write_tile_into_window(
-                &arr,
+                arr.as_ref(),
                 tx * tile_w,
                 ty * tile_h,
                 layout_planar,
@@ -211,10 +354,34 @@ pub async fn read_window_raster_f32(
             );
         }
 
-        Ok::<_, GtiError>(out)
+        Ok::<_, GtiError>((out, decoded_tiles))
     })
     .await
     .map_err(|e| GtiError::IndexLoad(e.to_string()))??;
+    record_decode_timing(perf_stats, decode_started.elapsed());
+
+    if let Some(cache) = pixel_cache
+        && !decoded_tiles.is_empty()
+    {
+        let mut guard = cache.lock().await;
+        for (tx, ty, arr) in &decoded_tiles {
+            let key = SourceTileKey::new(uri, *tx, *ty);
+            let bytes = decoded_array_byte_len(arr.as_ref());
+            guard.put(key, arr.clone(), bytes);
+        }
+        tracing::debug!(
+            target: "mosaic",
+            uri = uri,
+            src_x = window.x,
+            src_y = window.y,
+            src_w = window.width,
+            src_h = window.height,
+            inserted_tiles = decoded_tiles.len(),
+            "decoded tile cache insert"
+        );
+    }
+
+    drop(held_key_guards);
     drop(permit);
 
     // Build sub-grid aligned to the window.
@@ -237,32 +404,6 @@ pub async fn read_window_raster_f32(
         tiles_y = ty1 - ty0 + 1,
         "decode_tile: window read"
     );
-
-    // Populate cache if configured.
-    if let Some(cache) = pixel_cache {
-        let key = WindowKey::new(uri, window);
-        let entry = Arc::new(CachedWindow {
-            raster: Arc::new(out.clone()),
-            grid: sub_grid.clone(),
-        });
-        let bytes = out
-            .data()
-            .len()
-            .saturating_mul(std::mem::size_of::<f32>())
-            .max(1);
-        let mut guard = cache.lock().await;
-        guard.put(key, entry, bytes);
-        tracing::debug!(
-            target: "mosaic",
-            uri = uri,
-            src_x = window.x,
-            src_y = window.y,
-            src_w = window.width,
-            src_h = window.height,
-            bytes = bytes,
-            "pixel cache insert"
-        );
-    }
 
     Ok((out, sub_grid))
 }
@@ -340,33 +481,107 @@ fn write_tile_into_window(
     }
 }
 
-/// Cache key for windowed decodes.
-#[derive(Hash, PartialEq, Eq, Clone)]
-pub struct WindowKey {
+/// Cache key for source tile bytes.
+#[derive(Hash, PartialEq, Eq, Clone, PartialOrd, Ord)]
+pub struct SourceTileKey {
     uri: String,
     x: u32,
     y: u32,
-    w: u32,
-    h: u32,
 }
 
-impl WindowKey {
-    pub fn new(uri: &str, window: PixelWindow) -> Self {
+impl SourceTileKey {
+    pub fn new(uri: &str, x: usize, y: usize) -> Self {
         Self {
             uri: uri.to_string(),
-            x: window.x as u32,
-            y: window.y as u32,
-            w: window.width as u32,
-            h: window.height as u32,
+            x: x as u32,
+            y: y as u32,
         }
     }
 }
 
-/// Cached decode result (window raster + sub-grid).
-#[derive(Clone)]
-pub struct CachedWindow {
-    pub raster: Arc<RasterOwned>,
-    pub grid: GridSpec,
+async fn fetch_tiles_timed(
+    handle: &TileHandle,
+    xy: &[(usize, usize)],
+    perf_stats: Option<&PerfStatsSink>,
+) -> Result<Vec<Tile>> {
+    let started = Instant::now();
+    let fetched_tiles = handle
+        .ifd
+        .fetch_tiles(xy, handle.reader.as_ref())
+        .instrument(tracing::debug_span!(
+            "async_tiff.fetch_tiles",
+            count = xy.len()
+        ))
+        .await
+        .map_err(|e| GtiError::IndexLoad(e.to_string()))?;
+    let elapsed = started.elapsed();
+
+    let fetched_bytes = fetched_tiles
+        .iter()
+        .map(compressed_tile_byte_len)
+        .sum::<usize>();
+    update_perf_stats(perf_stats, |stats| {
+        stats.fetch_tiles_calls = stats.fetch_tiles_calls.saturating_add(1);
+        stats.fetch_tiles_tiles = stats.fetch_tiles_tiles.saturating_add(xy.len());
+        stats.fetch_tiles_bytes = stats.fetch_tiles_bytes.saturating_add(fetched_bytes);
+        stats.fetch_tiles_time += elapsed;
+    });
+
+    Ok(fetched_tiles)
+}
+
+fn compressed_tile_byte_len(tile: &Tile) -> usize {
+    let bytes = match tile.compressed_bytes() {
+        CompressedBytes::Chunky(bytes) => bytes.len(),
+        CompressedBytes::Planar(band_bytes) => band_bytes.iter().map(|bytes| bytes.len()).sum(),
+    };
+    bytes.max(1)
+}
+
+fn decoded_array_byte_len(arr: &async_tiff::Array) -> usize {
+    let bytes = match arr.data() {
+        async_tiff::TypedArray::Bool(v) => v.len() * std::mem::size_of::<bool>(),
+        async_tiff::TypedArray::UInt8(v) => v.len() * std::mem::size_of::<u8>(),
+        async_tiff::TypedArray::UInt16(v) => v.len() * std::mem::size_of::<u16>(),
+        async_tiff::TypedArray::UInt32(v) => v.len() * std::mem::size_of::<u32>(),
+        async_tiff::TypedArray::UInt64(v) => v.len() * std::mem::size_of::<u64>(),
+        async_tiff::TypedArray::Int8(v) => v.len() * std::mem::size_of::<i8>(),
+        async_tiff::TypedArray::Int16(v) => v.len() * std::mem::size_of::<i16>(),
+        async_tiff::TypedArray::Int32(v) => v.len() * std::mem::size_of::<i32>(),
+        async_tiff::TypedArray::Int64(v) => v.len() * std::mem::size_of::<i64>(),
+        async_tiff::TypedArray::Float32(v) => v.len() * std::mem::size_of::<f32>(),
+        async_tiff::TypedArray::Float64(v) => v.len() * std::mem::size_of::<f64>(),
+    };
+    bytes.max(1)
+}
+
+fn record_decode_timing(perf_stats: Option<&PerfStatsSink>, elapsed: Duration) {
+    update_perf_stats(perf_stats, |stats| {
+        stats.decode_windows = stats.decode_windows.saturating_add(1);
+        stats.decode_time += elapsed;
+    });
+}
+
+fn update_perf_stats(perf_stats: Option<&PerfStatsSink>, update: impl FnOnce(&mut PerfStats)) {
+    let Some(perf_stats) = perf_stats else {
+        return;
+    };
+    let mut guard = match perf_stats.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    update(&mut guard);
+}
+
+fn record_fetch_tiles_call(debug_log: Option<&FetchTilesDebugLog>, call: FetchTilesDebugCall) {
+    let Some(debug_log) = debug_log else {
+        return;
+    };
+    let mut guard = match debug_log.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.push(call);
 }
 
 fn build_affine_and_crs(ifd: &ImageFileDirectory) -> Result<(warp_rs::Affine2D, String)> {

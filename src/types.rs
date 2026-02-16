@@ -1,4 +1,6 @@
 use std::cmp::Ordering;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use geo::MultiPolygon;
@@ -228,12 +230,66 @@ pub struct BuildOptions {
     pub cache: Option<CacheConfig>,
     /// Optional cap on how many overlapping tiles (in sorted/z-order) are evaluated per output block.
     pub z_limit: Option<usize>,
+    /// Optional sink that records every underlying `async_tiff::fetch_tiles` call.
+    pub fetch_tiles_debug_log: Option<FetchTilesDebugLog>,
+    /// Optional aggregate perf counters for fetch/decode/reproject timing.
+    pub perf_stats: Option<PerfStatsSink>,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct CacheConfig {
     /// Metadata cache budget in bytes.
     pub meta_max_bytes: usize,
-    /// Pixel-window cache budget in bytes.
+    /// Source-tile cache budget in bytes.
     pub pixel_max_bytes: usize,
+}
+
+/// Shared debug log for `async_tiff::fetch_tiles` calls made by the mosaic pipeline.
+pub type FetchTilesDebugLog = Arc<Mutex<Vec<FetchTilesDebugCall>>>;
+
+/// One observed `async_tiff::fetch_tiles` call and context for dedupe validation.
+#[derive(Debug, Clone)]
+pub struct FetchTilesDebugCall {
+    pub uri: String,
+    pub window: DebugWindow,
+    /// Tiles needed for this window (`[tx, ty]` in source tile coordinates).
+    pub requested_tiles: Vec<(usize, usize)>,
+    /// Tiles actually passed to `fetch_tiles` for this call (misses after cache checks).
+    pub fetched_tiles: Vec<(usize, usize)>,
+    /// Tiles served from cache for this window.
+    pub cache_hits: usize,
+    /// Tiles fetched for this window.
+    pub cache_misses: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DebugWindow {
+    pub x: usize,
+    pub y: usize,
+    pub width: usize,
+    pub height: usize,
+}
+
+/// Shared aggregate performance counters sink.
+pub type PerfStatsSink = Arc<Mutex<PerfStats>>;
+
+/// Aggregate perf counters over one mosaic run.
+#[derive(Debug, Clone, Default)]
+pub struct PerfStats {
+    /// Number of underlying `async_tiff::fetch_tiles` calls.
+    pub fetch_tiles_calls: usize,
+    /// Number of source tiles passed to `fetch_tiles`.
+    pub fetch_tiles_tiles: usize,
+    /// Sum of compressed bytes returned by `fetch_tiles`.
+    pub fetch_tiles_bytes: usize,
+    /// Total wall-clock time spent in `fetch_tiles`.
+    pub fetch_tiles_time: Duration,
+    /// Number of decode windows processed.
+    pub decode_windows: usize,
+    /// Total wall-clock time spent decoding source tiles into window rasters.
+    pub decode_time: Duration,
+    /// Number of reproject calls.
+    pub reproject_calls: usize,
+    /// Total wall-clock time spent in warp reproject.
+    pub reproject_time: Duration,
 }

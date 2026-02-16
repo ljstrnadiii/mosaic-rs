@@ -15,7 +15,8 @@ use tokio::sync::{Mutex, Semaphore};
 use warp_rs::{CoordinateTransform, GridSpec, PixelWindow, WarpWorkTile};
 
 pub use types::{
-    BBox, BuildOptions, CacheConfig, DataType, GtiError, MosaicSpec, OutputWindow, Result,
+    BBox, BuildOptions, CacheConfig, DataType, DebugWindow, FetchTilesDebugCall,
+    FetchTilesDebugLog, GtiError, MosaicSpec, OutputWindow, PerfStats, PerfStatsSink, Result,
     SortValue, TileRecord,
 };
 
@@ -25,6 +26,7 @@ pub use warp_rs::{IdentityTransform, RasterOwned, Resample};
 
 type MetaCache = Arc<Mutex<cache::ByteLruCache<String, Arc<io::TileHandle>>>>;
 type MetaOpenGuards = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
+type TileFetchGuards = Arc<Mutex<HashMap<io::SourceTileKey, Arc<Mutex<()>>>>>;
 
 #[derive(Clone, Copy, Debug)]
 struct BlockWork {
@@ -41,6 +43,9 @@ struct BlockExecCtx {
     meta_cache: Option<MetaCache>,
     meta_open_guards: Option<MetaOpenGuards>,
     pixel_cache: Option<io::PixelCache>,
+    tile_fetch_guards: Option<TileFetchGuards>,
+    fetch_tiles_debug_log: Option<FetchTilesDebugLog>,
+    perf_stats: Option<PerfStatsSink>,
     dst_grid: Arc<GridSpec>,
     dst_crs: String,
     expected_bands: usize,
@@ -95,10 +100,16 @@ pub async fn build_mosaic_async(
 
     let tiles = index::filter_and_sort_tiles(tiles, spec, &dst);
     tracing::info!(target: "mosaic", tile_count = tiles.len(), "tiles filtered/sorted");
+    if opts.z_limit.is_some() && tiles.iter().any(|t| t.sort_key.is_none()) {
+        tracing::warn!(
+            target: "mosaic",
+            "z_limit is set but some tiles are missing sort keys; ordering falls back to location for those entries"
+        );
+    }
 
     let mut raster = compose::allocate_output(&dst.window, spec.band_count, spec.output_nodata)?;
 
-    let (meta_cache, meta_open_guards, pixel_cache) = build_caches(opts.cache);
+    let (meta_cache, meta_open_guards, pixel_cache, tile_fetch_guards) = build_caches(opts.cache);
     let block_concurrency = opts.max_tile_concurrency.max(1);
     let cpu_concurrency = opts.max_work_concurrency.max(1);
     let cpu_sem = Arc::new(Semaphore::new(cpu_concurrency));
@@ -116,6 +127,9 @@ pub async fn build_mosaic_async(
         meta_cache,
         meta_open_guards,
         pixel_cache,
+        tile_fetch_guards,
+        fetch_tiles_debug_log: opts.fetch_tiles_debug_log.clone(),
+        perf_stats: opts.perf_stats.clone(),
         dst_grid: Arc::new(dst.grid.clone()),
         dst_crs: dst.grid.crs.clone().unwrap_or_default(),
         expected_bands: spec.band_count as usize,
@@ -141,7 +155,7 @@ pub async fn build_mosaic_async(
             let _span =
                 tracing::trace_span!("compose.blit_block", block_x = block.x, block_y = block.y)
                     .entered();
-            compose::blit_block(
+            let _ = compose::blit_block(
                 &block_raster,
                 &mut raster,
                 block.x,
@@ -170,9 +184,10 @@ fn build_caches(
     Option<MetaCache>,
     Option<MetaOpenGuards>,
     Option<io::PixelCache>,
+    Option<TileFetchGuards>,
 ) {
     let Some(cfg) = cfg else {
-        return (None, None, None);
+        return (None, None, None, None);
     };
     let meta_cap = cfg.meta_max_bytes.max(1);
     let pixel_cap = cfg.pixel_max_bytes.max(1);
@@ -184,9 +199,10 @@ fn build_caches(
         >::new(meta_cap)))),
         Some(Arc::new(Mutex::new(HashMap::new()))),
         Some(Arc::new(Mutex::new(cache::ByteLruCache::<
-            io::WindowKey,
-            Arc<io::CachedWindow>,
+            io::SourceTileKey,
+            Arc<async_tiff::Array>,
         >::new(pixel_cap)))),
+        Some(Arc::new(Mutex::new(HashMap::new()))),
     )
 }
 
@@ -248,8 +264,22 @@ async fn process_block(
     };
     let dst_block_grid = planner::block_subgrid(exec_ctx.dst_grid.as_ref(), &block_work);
     let mut overlaps_considered = 0usize;
-
+    let mut overlaps_written = 0usize;
     for tile in exec_ctx.tiles.iter() {
+        if let Some(limit) = exec_ctx.z_limit
+            && overlaps_written >= limit
+        {
+            tracing::debug!(
+                target: "mosaic",
+                block_x = block.x,
+                block_y = block.y,
+                overlaps_written,
+                z_limit = limit,
+                "block: z-limit reached"
+            );
+            break;
+        }
+
         let handle = get_or_open_handle(
             &tile.location,
             exec_ctx.object_store.clone(),
@@ -277,11 +307,6 @@ async fn process_block(
             continue;
         };
 
-        if let Some(limit) = exec_ctx.z_limit
-            && overlaps_considered >= limit
-        {
-            break;
-        }
         overlaps_considered += 1;
 
         let reads_now = exec_ctx.reads_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
@@ -302,6 +327,9 @@ async fn process_block(
             src_window,
             &tile.location,
             exec_ctx.pixel_cache.as_ref(),
+            exec_ctx.tile_fetch_guards.as_ref(),
+            exec_ctx.fetch_tiles_debug_log.as_ref(),
+            exec_ctx.perf_stats.as_ref(),
             &exec_ctx.cpu_sem,
         )
         .await?;
@@ -338,6 +366,7 @@ async fn process_block(
             reprojects_in_flight = reprojects_now,
             "block: reproject start"
         );
+        let reproject_started = std::time::Instant::now();
         let reprojected = tokio::task::spawn_blocking(move || {
             let _span = reproject_span.enter();
             let src_view = warp_rs::RasterView::try_new_with_layout(
@@ -359,6 +388,7 @@ async fn process_block(
         })
         .await
         .map_err(|e| GtiError::IndexLoad(e.to_string()))??;
+        record_reproject_timing(exec_ctx.perf_stats.as_ref(), reproject_started.elapsed());
         let reprojects_now = exec_ctx.reprojects_in_flight.fetch_sub(1, Ordering::SeqCst) - 1;
         tracing::debug!(
             target: "mosaic",
@@ -370,18 +400,24 @@ async fn process_block(
         );
         drop(permit);
 
-        if compose::blit_block(
+        let blit = compose::blit_block(
             &reprojected,
             &mut block_raster,
             0,
             0,
             exec_ctx.output_nodata,
-        ) {
+        );
+        if blit.pixels_written > 0 {
+            overlaps_written += 1;
+        }
+
+        if blit.block_complete {
             tracing::debug!(
                 target: "mosaic",
                 dst_x = block.x,
                 dst_y = block.y,
                 uri = %tile.location,
+                pixels_written = blit.pixels_written,
                 "block filled; stop evaluating lower-priority tiles"
             );
             tracing::info!(
@@ -389,6 +425,7 @@ async fn process_block(
                 block_x = block.x,
                 block_y = block.y,
                 overlaps_considered,
+                overlaps_written,
                 "block: complete (filled)"
             );
             return Ok((block, block_raster, true));
@@ -400,6 +437,7 @@ async fn process_block(
         block_x = block.x,
         block_y = block.y,
         overlaps_considered,
+        overlaps_written,
         "block: complete (partial)"
     );
     Ok((block, block_raster, false))
@@ -472,6 +510,18 @@ async fn get_or_open_handle(
     );
     tracing::debug!(target: "mosaic", uri = location, "meta cache insert");
     Ok(opened)
+}
+
+fn record_reproject_timing(perf_stats: Option<&PerfStatsSink>, elapsed: std::time::Duration) {
+    let Some(perf_stats) = perf_stats else {
+        return;
+    };
+    let mut guard = match perf_stats.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.reproject_calls = guard.reproject_calls.saturating_add(1);
+    guard.reproject_time += elapsed;
 }
 
 fn estimate_meta_entry_bytes(handle: &io::TileHandle) -> usize {

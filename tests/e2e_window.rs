@@ -1,9 +1,11 @@
 #![cfg(feature = "geoparquet")]
 
 use mosaic_index::{
-    BBox, BuildOptions, DataType, MosaicSpec, Resample, build_mosaic, load_tiles_from_geoparquet,
+    BBox, BuildOptions, DataType, FetchTilesDebugLog, MosaicSpec, PerfStatsSink, Resample,
+    build_mosaic, load_tiles_from_geoparquet,
 };
 use object_store::aws::AmazonS3Builder;
+use std::collections::BTreeSet;
 use std::env;
 use std::fs::File;
 use std::fs::read_to_string;
@@ -22,7 +24,7 @@ fn build_small_window_from_geoparquet_subset() {
     let _perfetto_guard = init_tracing();
 
     // Load full index (assumed to fit in memory for test).
-    let tiles = load_tiles_from_geoparquet("index.parquet", "geometry", "url", None, None)
+    let tiles = load_tiles_from_geoparquet("index.parquet", "geometry", "url", Some("time"), None)
         .expect("load tiles");
     assert!(!tiles.is_empty());
 
@@ -87,21 +89,75 @@ fn build_small_window_from_geoparquet_subset() {
         builder = builder.with_token(token);
     }
     let store = builder.build().expect("build s3 store");
+    let fetch_tiles_debug_log: FetchTilesDebugLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let perf_stats: PerfStatsSink = Arc::new(std::sync::Mutex::new(Default::default()));
 
     let opts = BuildOptions {
         tokio_handle: None,
         object_store: Arc::new(store),
-        max_tile_concurrency: 8,
-        max_work_concurrency: 8,
+        max_tile_concurrency: 32,
+        max_work_concurrency: 16,
         cache: Some(mosaic_index::CacheConfig {
             meta_max_bytes: 1 * 1024 * 1024 * 1024,
-            pixel_max_bytes: 5 * 1024 * 1024 * 1024,
+            pixel_max_bytes: 8 * 1024 * 1024 * 1024,
         }),
-        z_limit: None,
+        z_limit: Some(4),
+        fetch_tiles_debug_log: Some(fetch_tiles_debug_log.clone()),
+        perf_stats: Some(perf_stats.clone()),
     };
 
     let result = build_mosaic(&spec, tiles, opts);
     let raster = result.expect("build_mosaic failed");
+    let fetch_calls = {
+        let guard = fetch_tiles_debug_log.lock().expect("debug log lock");
+        guard.clone()
+    };
+    let perf = {
+        let guard = perf_stats.lock().expect("perf stats lock");
+        guard.clone()
+    };
+    let total_requested: usize = fetch_calls.iter().map(|c| c.requested_tiles.len()).sum();
+    let total_fetched: usize = fetch_calls.iter().map(|c| c.fetched_tiles.len()).sum();
+    let mut unique_fetched = BTreeSet::new();
+    for call in &fetch_calls {
+        for &(tx, ty) in &call.fetched_tiles {
+            unique_fetched.insert((call.uri.clone(), tx, ty));
+        }
+    }
+    println!(
+        "fetch_tiles debug: calls={}, requested_total={}, fetched_total={}, unique_fetched={}",
+        fetch_calls.len(),
+        total_requested,
+        total_fetched,
+        unique_fetched.len()
+    );
+    println!(
+        "perf stats: fetch_calls={}, fetch_tiles={}, fetch_bytes={}, fetch_time_ms={:.1}, decode_windows={}, decode_time_ms={:.1}, reproject_calls={}, reproject_time_ms={:.1}",
+        perf.fetch_tiles_calls,
+        perf.fetch_tiles_tiles,
+        perf.fetch_tiles_bytes,
+        perf.fetch_tiles_time.as_secs_f64() * 1_000.0,
+        perf.decode_windows,
+        perf.decode_time.as_secs_f64() * 1_000.0,
+        perf.reproject_calls,
+        perf.reproject_time.as_secs_f64() * 1_000.0
+    );
+    if env::var("PRINT_FETCH_TILES_CALLS").ok().as_deref() == Some("1") {
+        for (idx, call) in fetch_calls.iter().enumerate() {
+            println!(
+                "fetch_tiles[{idx}] uri={} window=({}, {}, {}x{}) requested={:?} fetched={:?} hits={} misses={}",
+                call.uri,
+                call.window.x,
+                call.window.y,
+                call.window.width,
+                call.window.height,
+                call.requested_tiles,
+                call.fetched_tiles,
+                call.cache_hits,
+                call.cache_misses
+            );
+        }
+    }
     let (valid_pixels, min_val, max_val) = band0_stats(&raster, spec.output_nodata);
     println!(
         "result stats: valid_pixels={}, min={}, max={}",
@@ -294,6 +350,7 @@ fn write_geotiff_f32(
     let epsg = parse_epsg_code(dst_grid.crs.as_deref()).ok_or("dst_crs must be EPSG:<code>")?;
     let geokeys = build_geo_key_directory(epsg);
     let model_transform = affine_to_model_transformation(dst_grid.affine);
+    let stats_xml = build_gdal_stats_metadata_xml(bands, 0.0, 3000.0);
 
     // IFD offset immediately after pixel data.
     let data_offset = 8u32;
@@ -319,6 +376,7 @@ fn write_geotiff_f32(
         IfdEntry::new(33550, 12, 3, 0),  // ModelPixelScaleTag
         IfdEntry::new(33922, 12, 6, 0),  // ModelTiepointTag
         IfdEntry::new(42112, 2, nodata.to_string().len() as u32 + 1, 0), // GDAL_NODATA
+        IfdEntry::new(42113, 2, stats_xml.len() as u32 + 1, 0), // GDAL_METADATA (stats)
     ];
 
     entries.sort_by_key(|e| e.tag);
@@ -422,6 +480,16 @@ fn write_geotiff_f32(
         .unwrap()
         .value_or_offset = nodata_offset;
 
+    // GDAL_METADATA with explicit display stats so QGIS opens with a useful stretch.
+    let mut stats_bytes = stats_xml.into_bytes();
+    stats_bytes.push(0);
+    let stats_offset = push_extra(&stats_bytes, 1)?;
+    entries
+        .iter_mut()
+        .find(|e| e.tag == 42113)
+        .unwrap()
+        .value_or_offset = stats_offset;
+
     // Write file: header, data, IFD, extra
     let mut writer = std::io::BufWriter::new(File::create(path)?);
     writer.write_all(b"II")?;
@@ -486,6 +554,20 @@ fn build_geo_key_directory(epsg: u16) -> Vec<u16> {
             3072, 0, 1, epsg, // ProjectedCSTypeGeoKey
         ]
     }
+}
+
+fn build_gdal_stats_metadata_xml(bands: u32, min: f64, max: f64) -> String {
+    let mut xml = String::from("<GDALMetadata>");
+    for sample in 0..bands {
+        xml.push_str(&format!(
+            "<Item name=\"STATISTICS_MINIMUM\" sample=\"{sample}\">{min}</Item>"
+        ));
+        xml.push_str(&format!(
+            "<Item name=\"STATISTICS_MAXIMUM\" sample=\"{sample}\">{max}</Item>"
+        ));
+    }
+    xml.push_str("</GDALMetadata>");
+    xml
 }
 
 fn affine_to_model_transformation(affine: warp_rs::Affine2D) -> [f64; 16] {

@@ -50,6 +50,7 @@ dependencies = [
 [[package]]
 name = "async-tiff"
 version = "0.2.0"
+source = "git+https://github.com/developmentseed/async-tiff.git?branch=main#538196d9a7b8988f1ae1fa2c8659abf3ba8e7c07"
 dependencies = [
  "async-trait",
  "bytemuck",
@@ -2162,6 +2163,7 @@ dependencies = [
 [[package]]
 name = "warp-rs"
 version = "0.1.0"
+source = "git+https://github.com/ljstrnadiii/warp-rs.git?branch=main#2f69819f93041c3cd9777a481be8b0145575916f"
 dependencies = [
  "proj",
  "rayon",

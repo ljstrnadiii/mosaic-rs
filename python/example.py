@@ -19,17 +19,19 @@ from mosaic_index import (
 )
 
 # Hard-coded inputs, matching the e2e style.
-INDEX_PATH = "../index.parquet"
-OUTPUT_GEOTIFF_PATH = "/tmp/test_window_geotiff.tif"
+INDEX_PATH = "../index.parquet"  
 URL_COLUMN = "url"
 SORT_COLUMN = "time"
 GEOMETRY_COLUMN = "geometry"
-DST_CRS = "EPSG:4326"
 AWS_REGION = "us-west-2"
 
+
+OUTPUT_GEOTIFF_PATH = "/tmp/test_window_geotiff.tif"
+DST_CRS = "EPSG:4326"
+
 # Colorado 1.2 degree box centered on 4 interseting tiles from two different CRSs (UTM zones).
-width = .6
-height = .6
+width = 0.6
+height = 0.6
 BBOX = BBox(
     -107.333 - width / 2, 39.668 - height / 2, -107.333 + width / 2, 39.668 + height / 2
 )
@@ -43,6 +45,7 @@ OUTPUT_NODATA = -9999.0
 # options for profiling
 RUST_LOG = os.getenv("RUST_LOG")
 PERFETTO_TRACE_PATH = os.getenv("MOSAIC_PERFETTO_TRACE")
+WRITE_GEOTIFF = os.getenv("MOSAIC_WRITE_GEOTIFF", None) == "1"
 
 _logger = logging.getLogger("simple_mosaic")
 
@@ -153,17 +156,17 @@ def main() -> None:
         array = raster.data()
         _logger.info("Data array shape: %s", array.shape)
 
-        # TODO: attach spec to raster
-        write_geotiff(array, resx=resx, resy=resy)
+        if WRITE_GEOTIFF:
+            write_geotiff(array, resx=resx, resy=resy)
 
-        _logger.info("wrote %s", OUTPUT_GEOTIFF_PATH)
-        _logger.info("tiles_used=%d", len(tiles))
-        _logger.info(
-            "shape=(height=%d, width=%d, bands=%d)",
-            raster.height,
-            raster.width,
-            raster.bands,
-        )
+            _logger.info("wrote %s", OUTPUT_GEOTIFF_PATH)
+            _logger.info("tiles_used=%d", len(tiles))
+            _logger.info(
+                "shape=(height=%d, width=%d, bands=%d)",
+                raster.height,
+                raster.width,
+                raster.bands,
+            )
     if PERFETTO_TRACE_PATH:
         _logger.info("perfetto trace finalized at %s", PERFETTO_TRACE_PATH)
 

@@ -13,6 +13,7 @@ from rasterio.transform import from_origin
 from mosaic_index import (
     BBox,
     MosaicSpec,
+    Resampling,
     TileRecord,
     TracingSession,
     build_mosaic,
@@ -28,8 +29,8 @@ DST_CRS = "EPSG:4326"
 AWS_REGION = "us-west-2"
 
 # Colorado 1.2 degree box centered on 4 interseting tiles from two different CRSs (UTM zones).
-width = .6
-height = .6
+width = 0.6
+height = 0.6
 BBOX = BBox(
     -107.333 - width / 2, 39.668 - height / 2, -107.333 + width / 2, 39.668 + height / 2
 )
@@ -62,19 +63,6 @@ def meters_to_degrees(res_meters: float, center_lat: float) -> tuple[float, floa
     return float(resx), float(resy)
 
 
-def load_tiles() -> list[TileRecord]:
-    _logger.info("Loading index parquet: %s", INDEX_PATH)
-    gdf = gpd.read_parquet(INDEX_PATH)
-    _logger.info("Loaded %d index rows", len(gdf))
-
-    tiles: list[TileRecord] = [
-        TileRecord(
-            str(row[URL_COLUMN]), *row["geometry"].bounds, sort_key=row[SORT_COLUMN]
-        )
-        for _, row in gdf.iterrows()
-    ]
-    return tiles
-
 
 def write_geotiff(data_chunky: np.ndarray, resx: float, resy: float) -> None:
     band_first = np.moveaxis(data_chunky, 2, 0)
@@ -105,13 +93,21 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    _logger.info("Starting simple mosaic example")
 
     center_lat = (BBOX.miny + BBOX.maxy) / 2.0
     resx, resy = meters_to_degrees(RES_METERS, center_lat)
     _logger.info("Resolution degrees: resx=%s resy=%s", resx, resy)
 
-    tiles = load_tiles()
+    gdf = gpd.read_parquet(INDEX_PATH)
+    _logger.info("Loaded %d index rows", len(gdf))
+
+    tiles: list[TileRecord] = [
+        TileRecord(
+            str(row[URL_COLUMN]), *row["geometry"].bounds, sort_key=row[SORT_COLUMN]
+        )
+        for _, row in gdf.iterrows()
+    ]
+
     bucket, _ = split_s3_uri(tiles[0].location)
     _logger.info("Using S3 bucket: %s", bucket)
     store = S3Store(bucket, region=AWS_REGION)
@@ -122,10 +118,10 @@ def main() -> None:
         bbox=BBOX,
         dst_crs=DST_CRS,
         band_count=BAND_COUNT,
-        data_type="F32",
+        dtype=np.dtype(np.float32),
         blockxsize=BLOCK_SIZE,
         blockysize=BLOCK_SIZE,
-        resampling="Nearest",
+        resampling=Resampling.CUBIC,
         sort_ascending=True,
         output_nodata=OUTPUT_NODATA,
     )
@@ -133,13 +129,14 @@ def main() -> None:
     with TracingSession(rust_log=RUST_LOG, perfetto_path=PERFETTO_TRACE_PATH):
         raster = build_mosaic(
             spec,
-            tiles,  # TODO: take anything that implements an geoarrow table to directly pass gdf
+            tiles,  # TODO: take anything that implements a geoarrow table to directly pass gdf
             store=store,
             max_tile_concurrency=32,
             max_work_concurrency=16,
             cache_meta_max_bytes=1 * 1024 * 1024 * 1024,
             cache_pixel_max_bytes=8 * 1024 * 1024 * 1024,
             z_limit=4,
+            working_type=np.float32,
         )
 
         _logger.info(

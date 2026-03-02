@@ -4,7 +4,7 @@ use chrono::{DateTime, FixedOffset, Utc};
 use geo::{LineString, MultiPolygon, Polygon};
 use mosaic_index::{
     BBox, BuildOptions, CacheConfig, DataType, GtiError, MosaicSpec, OutputWindow, RasterOwned,
-    Resample, SortValue, TileRecord, build_mosaic, build_mosaic_async,
+    Resample, SortValue, TileRecord, WorkingType, build_mosaic, build_mosaic_async,
 };
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::ffi;
@@ -134,10 +134,10 @@ impl PyMosaicSpec {
         dst_crs,
         *,
         band_count=1,
-        data_type="F32",
+        dtype=None,
         blockxsize=1024,
         blockysize=1024,
-        resampling="Nearest",
+        resampling=None,
         sort_ascending=true,
         output_nodata=-9999.0,
         window=None
@@ -148,10 +148,10 @@ impl PyMosaicSpec {
         bbox: PyBBox,
         dst_crs: String,
         band_count: u16,
-        data_type: &str,
+        dtype: Option<&Bound<'_, PyAny>>,
         blockxsize: u32,
         blockysize: u32,
-        resampling: &str,
+        resampling: Option<&Bound<'_, PyAny>>,
         sort_ascending: bool,
         output_nodata: f32,
         window: Option<PyOutputWindow>,
@@ -162,7 +162,7 @@ impl PyMosaicSpec {
             bbox: bbox.into(),
             dst_crs,
             band_count,
-            data_type: parse_data_type(data_type)?,
+            data_type: parse_dtype(dtype)?,
             blockxsize,
             blockysize,
             resampling: parse_resample(resampling)?,
@@ -326,7 +326,8 @@ impl PyRaster {
     max_work_concurrency=16,
     cache_meta_max_bytes=None,
     cache_pixel_max_bytes=None,
-    z_limit=None
+    z_limit=None,
+    working_type=None
 ))]
 fn build_mosaic_py(
     py: Python<'_>,
@@ -338,9 +339,11 @@ fn build_mosaic_py(
     cache_meta_max_bytes: Option<usize>,
     cache_pixel_max_bytes: Option<usize>,
     z_limit: Option<usize>,
+    working_type: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<PyRaster> {
     let spec = spec.inner;
     let tiles = tiles.into_iter().map(|tile| tile.inner).collect::<Vec<_>>();
+    let working_type = parse_working_type(working_type)?;
     let opts = build_options(
         store,
         max_tile_concurrency,
@@ -348,6 +351,7 @@ fn build_mosaic_py(
         cache_meta_max_bytes,
         cache_pixel_max_bytes,
         z_limit,
+        working_type,
     );
 
     let raster = py.detach(move || build_mosaic(&spec, tiles, opts).map_err(to_py_err))?;
@@ -364,7 +368,8 @@ fn build_mosaic_py(
     max_work_concurrency=16,
     cache_meta_max_bytes=None,
     cache_pixel_max_bytes=None,
-    z_limit=None
+    z_limit=None,
+    working_type=None
 ))]
 fn build_mosaic_async_py<'py>(
     py: Python<'py>,
@@ -376,9 +381,11 @@ fn build_mosaic_async_py<'py>(
     cache_meta_max_bytes: Option<usize>,
     cache_pixel_max_bytes: Option<usize>,
     z_limit: Option<usize>,
+    working_type: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let spec = spec.inner;
     let tiles = tiles.into_iter().map(|tile| tile.inner).collect::<Vec<_>>();
+    let working_type = parse_working_type(working_type)?;
     let opts = build_options(
         store,
         max_tile_concurrency,
@@ -386,6 +393,7 @@ fn build_mosaic_async_py<'py>(
         cache_meta_max_bytes,
         cache_pixel_max_bytes,
         z_limit,
+        working_type,
     );
 
     future_into_py(py, async move {
@@ -515,12 +523,14 @@ fn build_options(
     cache_meta_max_bytes: Option<usize>,
     cache_pixel_max_bytes: Option<usize>,
     z_limit: Option<usize>,
+    working_type: Option<WorkingType>,
 ) -> BuildOptions {
     BuildOptions {
         tokio_handle: None,
         object_store: store.into_dyn(),
         max_tile_concurrency,
         max_work_concurrency,
+        working_type,
         cache: build_cache_config(cache_meta_max_bytes, cache_pixel_max_bytes),
         z_limit,
         fetch_tiles_debug_log: None,
@@ -593,28 +603,280 @@ fn parse_sort_key(value: Option<&Bound<'_, PyAny>>) -> PyResult<Option<SortValue
     ))
 }
 
-fn parse_data_type(name: &str) -> PyResult<DataType> {
+fn parse_dtype(value: Option<&Bound<'_, PyAny>>) -> PyResult<DataType> {
+    let Some(value) = value else {
+        return Ok(DataType::F32);
+    };
+    if value.is_none() {
+        return Ok(DataType::F32);
+    }
+
+    let np = value.py().import("numpy").map_err(|_| {
+        PyValueError::new_err(
+            "dtype requires NumPy. Install numpy and pass an np.dtype object (e.g. np.dtype('float32'))",
+        )
+    })?;
+    let dtype_cls = np.getattr("dtype")?;
+    if !value.is_instance(&dtype_cls)? {
+        return Err(PyValueError::new_err(
+            "unsupported dtype. Expected an np.dtype object (e.g. np.dtype('float32'))",
+        ));
+    }
+
+    if let Ok(name) = value.getattr("value").and_then(|v| v.extract::<String>()) {
+        return parse_dtype_name(&name);
+    }
+    if let Ok(name) = value.getattr("name").and_then(|v| v.extract::<String>()) {
+        return parse_dtype_name(&name);
+    }
+
+    Err(PyValueError::new_err(
+        "unsupported dtype. Could not read dtype.name from np.dtype value",
+    ))
+}
+
+fn parse_dtype_name(name: &str) -> PyResult<DataType> {
     match name.to_ascii_lowercase().as_str() {
-        "u8" => Ok(DataType::U8),
-        "u16" => Ok(DataType::U16),
-        "i16" => Ok(DataType::I16),
-        "u32" => Ok(DataType::U32),
-        "i32" => Ok(DataType::I32),
-        "f32" => Ok(DataType::F32),
-        "f64" => Ok(DataType::F64),
+        "u8" | "uint8" => Ok(DataType::U8),
+        "u16" | "uint16" => Ok(DataType::U16),
+        "i16" | "int16" => Ok(DataType::I16),
+        "u32" | "uint32" => Ok(DataType::U32),
+        "i32" | "int32" => Ok(DataType::I32),
+        "f32" | "float32" => Ok(DataType::F32),
+        "f64" | "float64" => Ok(DataType::F64),
         _ => Err(PyValueError::new_err(format!(
-            "unsupported data_type '{name}'. Expected one of: U8, U16, I16, U32, I32, F32, F64"
+            "unsupported dtype '{name}'. Expected one of: uint8, uint16, int16, uint32, int32, float32, float64"
         ))),
     }
 }
 
-fn parse_resample(name: &str) -> PyResult<Resample> {
+fn parse_resample(value: Option<&Bound<'_, PyAny>>) -> PyResult<Resample> {
+    let Some(value) = value else {
+        return Ok(Resample::Nearest);
+    };
+    if value.is_none() {
+        return Ok(Resample::Nearest);
+    }
+
+    let enum_cls = value
+        .py()
+        .import("enum")
+        .and_then(|m| m.getattr("Enum"))?;
+    if !value.is_instance(&enum_cls)? {
+        return Err(PyValueError::new_err(
+            "unsupported resampling. Expected a mosaic_index.Resampling enum member (e.g. Resampling.NEAREST)",
+        ));
+    }
+
+    let Ok(name) = value.getattr("value").and_then(|v| v.extract::<String>()) else {
+        return Err(PyValueError::new_err(
+            "unsupported resampling. Could not read enum value. Expected a mosaic_index.Resampling enum member (e.g. Resampling.NEAREST)",
+        ));
+    };
+
     match name.to_ascii_lowercase().as_str() {
         "nearest" => Ok(Resample::Nearest),
         "bilinear" => Ok(Resample::Bilinear),
+        "cubic" => Ok(Resample::Cubic),
+        "average" => Ok(Resample::Average),
+        "sum" => Ok(Resample::Sum),
         _ => Err(PyValueError::new_err(format!(
-            "unsupported resampling '{name}'. Expected one of: Nearest, Bilinear"
+            "unsupported resampling '{name}'. Expected one of: Nearest, Bilinear, Cubic, Average, Sum"
         ))),
+    }
+}
+
+fn parse_working_type(value: Option<&Bound<'_, PyAny>>) -> PyResult<Option<WorkingType>> {
+    let Some(value) = value else {
+        return Ok(Some(WorkingType::Auto));
+    };
+    if value.is_none() {
+        return Ok(Some(WorkingType::Auto));
+    }
+
+    let np = value.py().import("numpy").map_err(|_| {
+        PyValueError::new_err(
+            "working_type requires NumPy. Expected np.float32, np.float64, or None",
+        )
+    })?;
+
+    let np_float32 = np.getattr("float32")?;
+    if value.eq(np_float32.as_any())? {
+        return Ok(Some(WorkingType::F32));
+    }
+
+    let np_float64 = np.getattr("float64")?;
+    if value.eq(np_float64.as_any())? {
+        return Ok(Some(WorkingType::F64));
+    }
+
+    Err(PyValueError::new_err(
+        "unsupported working_type. Expected np.float32, np.float64, or None",
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pyo3::types::{PyDict, PyString};
+    use std::sync::Once;
+
+    fn ensure_python() {
+        static INIT: Once = Once::new();
+        INIT.call_once(Python::initialize);
+    }
+
+    fn enum_member<'py>(
+        py: Python<'py>,
+        enum_name: &str,
+        member_name: &str,
+        value: &str,
+    ) -> Bound<'py, PyAny> {
+        let enum_mod = py.import("enum").expect("enum import");
+        let enum_ctor = enum_mod.getattr("Enum").expect("Enum");
+        let members = PyDict::new(py);
+        members.set_item(member_name, value).expect("set member");
+        let enum_cls = enum_ctor
+            .call1((enum_name, &members))
+            .expect("create enum class");
+        enum_cls.getattr(member_name).expect("enum member")
+    }
+
+    #[test]
+    fn parse_resample_defaults_to_nearest() {
+        assert!(matches!(parse_resample(None), Ok(Resample::Nearest)));
+    }
+
+    #[test]
+    fn parse_resample_accepts_enum_value_attr() {
+        ensure_python();
+        Python::attach(|py| {
+            assert!(matches!(
+                parse_resample(Some(enum_member(py, "Resampling", "A", "Nearest").as_any())),
+                Ok(Resample::Nearest)
+            ));
+            assert!(matches!(
+                parse_resample(Some(enum_member(py, "Resampling", "A", "Bilinear").as_any())),
+                Ok(Resample::Bilinear)
+            ));
+            assert!(matches!(
+                parse_resample(Some(enum_member(py, "Resampling", "A", "Cubic").as_any())),
+                Ok(Resample::Cubic)
+            ));
+            assert!(matches!(
+                parse_resample(Some(enum_member(py, "Resampling", "A", "Average").as_any())),
+                Ok(Resample::Average)
+            ));
+            assert!(matches!(
+                parse_resample(Some(enum_member(py, "Resampling", "A", "Sum").as_any())),
+                Ok(Resample::Sum)
+            ));
+        });
+    }
+
+    #[test]
+    fn parse_resample_rejects_literal_string_and_invalid_value() {
+        ensure_python();
+        Python::attach(|py| {
+            let raw = PyString::new(py, "Nearest");
+            assert!(parse_resample(Some(raw.as_any())).is_err());
+            assert!(
+                parse_resample(Some(enum_member(py, "Resampling", "A", "Lanczos").as_any()))
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn parse_dtype_defaults_to_f32() {
+        assert!(matches!(parse_dtype(None), Ok(DataType::F32)));
+    }
+
+    #[test]
+    fn parse_dtype_accepts_numpy_dtype_values() {
+        ensure_python();
+        Python::attach(|py| {
+            let Ok(np) = py.import("numpy") else {
+                return;
+            };
+
+            let u8 = np.call_method1("dtype", ("uint8",)).expect("dtype uint8");
+            assert!(matches!(
+                parse_dtype(Some(u8.as_any())),
+                Ok(DataType::U8)
+            ));
+            let f64 = np.call_method1("dtype", ("float64",)).expect("dtype float64");
+            assert!(matches!(
+                parse_dtype(Some(f64.as_any())),
+                Ok(DataType::F64)
+            ));
+        });
+    }
+
+    #[test]
+    fn parse_dtype_rejects_non_numpy_dtype_values() {
+        ensure_python();
+        Python::attach(|py| {
+            let raw = PyString::new(py, "float32");
+            assert!(parse_dtype(Some(raw.as_any())).is_err());
+
+            let Ok(np) = py.import("numpy") else {
+                return;
+            };
+            let f32_type = np.getattr("float32").expect("numpy.float32");
+            assert!(parse_dtype(Some(f32_type.as_any())).is_err());
+        });
+    }
+
+    #[test]
+    fn parse_working_type_defaults_to_auto() {
+        ensure_python();
+        assert!(matches!(
+            parse_working_type(None),
+            Ok(Some(WorkingType::Auto))
+        ));
+        Python::attach(|py| {
+            let py_none = py.None();
+            assert!(matches!(
+                parse_working_type(Some(py_none.bind(py))),
+                Ok(Some(WorkingType::Auto))
+            ));
+        });
+    }
+
+    #[test]
+    fn parse_working_type_accepts_numpy_float_types() {
+        ensure_python();
+        Python::attach(|py| {
+            let Ok(np) = py.import("numpy") else {
+                return;
+            };
+            let f32_type = np.getattr("float32").expect("numpy.float32");
+            let f64_type = np.getattr("float64").expect("numpy.float64");
+            assert!(matches!(
+                parse_working_type(Some(f32_type.as_any())),
+                Ok(Some(WorkingType::F32))
+            ));
+            assert!(matches!(
+                parse_working_type(Some(f64_type.as_any())),
+                Ok(Some(WorkingType::F64))
+            ));
+        });
+    }
+
+    #[test]
+    fn parse_working_type_rejects_strings_and_dtypes() {
+        ensure_python();
+        Python::attach(|py| {
+            let bad = PyString::new(py, "auto");
+            assert!(parse_working_type(Some(bad.as_any())).is_err());
+
+            let Ok(np) = py.import("numpy") else {
+                return;
+            };
+            let f32_dtype = np.call_method1("dtype", ("float32",)).expect("dtype float32");
+            assert!(parse_working_type(Some(f32_dtype.as_any())).is_err());
+        });
     }
 }
 

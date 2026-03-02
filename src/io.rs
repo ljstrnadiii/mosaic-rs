@@ -91,8 +91,6 @@ pub fn tile_meta_from_handle(handle: &TileHandle, dst_crs: &str) -> Result<TileM
         };
 
     Ok(TileMeta {
-        width: handle.src_grid.width,
-        height: handle.src_grid.height,
         bands: handle.bands,
         src_grid: handle.src_grid.clone(),
         dst_to_src,

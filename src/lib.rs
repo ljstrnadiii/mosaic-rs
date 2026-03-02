@@ -20,7 +20,7 @@ pub use types::{
     SortValue, TileRecord,
 };
 
-pub use warp_rs::{IdentityTransform, RasterOwned, Resample};
+pub use warp_rs::{IdentityTransform, RasterOwned, Resample, WorkingType};
 
 type MetaCache = Arc<Mutex<cache::ByteLruCache<String, Arc<io::TileHandle>>>>;
 type MetaOpenGuards = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
@@ -49,6 +49,7 @@ struct BlockExecCtx {
     expected_bands: usize,
     output_nodata: f32,
     resample: Resample,
+    working_type: Option<warp_rs::WorkingType>,
     z_limit: Option<usize>,
     cpu_sem: Arc<Semaphore>,
     reads_in_flight: Arc<AtomicUsize>,
@@ -133,6 +134,7 @@ pub async fn build_mosaic_async(
         expected_bands: spec.band_count as usize,
         output_nodata: spec.output_nodata,
         resample: spec.resampling,
+        working_type: opts.working_type,
         z_limit: opts.z_limit,
         cpu_sem,
         reads_in_flight: Arc::new(AtomicUsize::new(0)),
@@ -349,6 +351,7 @@ async fn process_block(
             .map_err(|e| GtiError::IndexLoad(e.to_string()))?;
         let dst_block_grid_for_reproject = dst_block_grid.clone();
         let resample = exec_ctx.resample;
+        let working_type = exec_ctx.working_type;
         let reproject_span = tracing::debug_span!(
             "warp.reproject_block",
             block_x = block.x,
@@ -381,7 +384,7 @@ async fn process_block(
                 resample,
                 meta.dst_to_src.as_ref(),
                 meta.nodata,
-                warp_rs::NodataPolicy::PixelStrict,
+                working_type,
             )
         })
         .await

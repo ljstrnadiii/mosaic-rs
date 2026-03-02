@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Awaitable, Literal
+from enum import Enum
+from typing import Any, Awaitable
 
 import numpy as np
 import numpy.typing as npt
@@ -9,6 +10,12 @@ from obstore.store import ObjectStore
 
 __version__: str
 
+class Resampling(str, Enum):
+    NEAREST = "Nearest"
+    BILINEAR = "Bilinear"
+    CUBIC = "Cubic"
+    AVERAGE = "Average"
+    SUM = "Sum"
 
 class BBox:
     def __init__(self, minx: float, miny: float, maxx: float, maxy: float) -> None: ...
@@ -21,7 +28,6 @@ class BBox:
     @property
     def maxy(self) -> float: ...
 
-
 class OutputWindow:
     def __init__(self, x_off: int, y_off: int, width: int, height: int) -> None: ...
     @property
@@ -33,7 +39,6 @@ class OutputWindow:
     @property
     def height(self) -> int: ...
 
-
 class MosaicSpec:
     def __init__(
         self,
@@ -43,15 +48,14 @@ class MosaicSpec:
         dst_crs: str,
         *,
         band_count: int = 1,
-        data_type: Literal["U8", "U16", "I16", "U32", "I32", "F32", "F64"] = "F32",
+        dtype: np.dtype[Any] | None = None,
         blockxsize: int = 1024,
         blockysize: int = 1024,
-        resampling: Literal["Nearest", "Bilinear"] = "Nearest",
+        resampling: Resampling = Resampling.NEAREST,
         sort_ascending: bool = True,
         output_nodata: float = -9999.0,
         window: OutputWindow | None = None,
     ) -> None: ...
-
 
 class TileRecord:
     def __init__(
@@ -66,7 +70,6 @@ class TileRecord:
     ) -> None: ...
     @property
     def location(self) -> str: ...
-
 
 class Raster:
     @property
@@ -90,7 +93,6 @@ class TracingSession:
     def __enter__(self) -> TracingSession: ...
     def __exit__(self, exc_type: object, exc: object, tb: object) -> bool: ...
 
-
 def build_mosaic(
     spec: MosaicSpec,
     tiles: list[TileRecord],
@@ -101,9 +103,8 @@ def build_mosaic(
     cache_meta_max_bytes: int | None = None,
     cache_pixel_max_bytes: int | None = None,
     z_limit: int | None = None,
+    working_type: type[np.float32] | type[np.float64] | None = None,
 ) -> Raster: ...
-
-
 def build_mosaic_async(
     spec: MosaicSpec,
     tiles: list[TileRecord],
@@ -114,17 +115,15 @@ def build_mosaic_async(
     cache_meta_max_bytes: int | None = None,
     cache_pixel_max_bytes: int | None = None,
     z_limit: int | None = None,
+    working_type: type[np.float32] | type[np.float64] | None = None,
 ) -> Awaitable[Raster]: ...
-
 def init_tracing(
     *,
     rust_log: str | None = None,
     perfetto_path: str | None = None,
     include_args: bool = False,
 ) -> bool: ...
-
 def flush_tracing() -> bool: ...
 def shutdown_tracing() -> bool: ...
-
 
 __all__: list[str]

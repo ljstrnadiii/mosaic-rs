@@ -24,6 +24,7 @@ dev = [
 ]
 
 [tool.maturin]
+bindings = "pyo3"
 features = ["pyo3/extension-module"]
 module-name = "mosaic_index._mosaic_index"
 python-source = "python"

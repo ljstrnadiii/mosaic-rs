@@ -13,7 +13,7 @@ object_store = ["async-tiff/object_store"]
 perfetto = ["dep:tracing-chrome"]
 
 [dependencies]
-warp-rs = { path = "../warp-rs", default-features = false }
+warp-rs = { git = "https://github.com/ljstrnadiii/warp-rs.git", branch = "main", default-features = false }
 async-tiff = { path = "../async-tiff", default-features = false }
 proj = { version = "0.31", optional = true }
 geo = "0.28"

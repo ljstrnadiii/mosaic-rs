@@ -41,7 +41,7 @@ pub async fn build_mosaic_async(
 use std::sync::Arc;
 
 use mosaic_index::{
-    build_mosaic, BBox, BuildOptions, CacheConfig, DataType, MosaicSpec, Resample,
+    build_mosaic, BBox, BuildOptions, CacheConfig, DataType, MosaicSpec, Resample, WorkingType,
 };
 
 // tiles: Vec<TileRecord> from your index source.
@@ -68,6 +68,7 @@ let opts = BuildOptions {
     object_store: store,
     max_tile_concurrency: 32,
     max_work_concurrency: 16,
+    working_type: Some(WorkingType::Auto),
     cache: Some(CacheConfig {
         meta_max_bytes: 512 * 1024 * 1024,
         pixel_max_bytes: 2 * 1024 * 1024 * 1024,
@@ -87,16 +88,14 @@ let raster = build_mosaic(&spec, tiles, opts)?;
 - `cache`: metadata + decoded tile cache byte budgets.
 - `max_tile_concurrency`: block-level scheduling concurrency.
 - `max_work_concurrency`: CPU-side decode/reproject concurrency.
+- `working_type`: optional warp working precision (`Auto`, `F32`, `F64`).
 - `fetch_tiles_debug_log`: captures every `async_tiff::fetch_tiles` call input.
 - `perf_stats`: aggregate fetch/decode/reproject counters and timing.
 
 ## Notes
 
 - Output type is `warp_rs::RasterOwned`.
+- Supported resampling methods: `Nearest`, `Bilinear`, `Cubic`, `Average`, `Sum`.
 - Source reads are windowed; only needed TIFF tiles are fetched.
 - Pixel cache stores decoded source tiles keyed by `(uri, tile_x, tile_y)` to avoid repeated decode work across overlapping windows.
 
-
-## TODO
-1. drop z_limit
-2. 

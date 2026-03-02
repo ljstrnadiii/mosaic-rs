@@ -17,6 +17,20 @@ maturin develop
 python example.py
 ```
 
+The Python API now supports these resampling values on `MosaicSpec(resampling=...)`:
+`"Nearest"`, `"Bilinear"`, `"Cubic"`, `"Average"`, `"Sum"`.
+
+`MosaicSpec` accepts:
+- `dtype` as `np.dtype(...)` (for example `np.dtype(np.float32)`).
+- `resampling` as `Resampling.*` enum members.
+
+You can also control warp working precision on `build_mosaic`/`build_mosaic_async` with:
+`working_type=None | np.float32 | np.float64`
+(`None` maps to auto behavior).
+
+Preferred usage is:
+`dtype=np.dtype(np.float32)`, `resampling=Resampling.CUBIC`, and `working_type=np.float64`.
+
 Take a look at `example.py` for a full end-to-end example demonstrating reprojection and resampling
 from multiple tiles if differenent CRS to a target grid as visualized below:
 

@@ -208,10 +208,6 @@ pub struct TileRecord {
 
 #[derive(Clone)]
 pub struct TileMeta {
-    #[allow(dead_code)]
-    pub width: usize,
-    #[allow(dead_code)]
-    pub height: usize,
     pub bands: usize,
     pub src_grid: warp_rs::GridSpec,
     pub dst_to_src: std::sync::Arc<dyn warp_rs::CoordinateTransform>,
@@ -226,6 +222,8 @@ pub struct BuildOptions {
     pub max_tile_concurrency: usize,
     /// Max number of CPU-side decode/reproject tasks to run concurrently.
     pub max_work_concurrency: usize,
+    /// Optional precision policy for warp working type (`None` = `warp_rs::WorkingType::Auto`).
+    pub working_type: Option<warp_rs::WorkingType>,
     /// Optional cache configuration (if None, no caching).
     pub cache: Option<CacheConfig>,
     /// Optional cap on how many overlapping tiles (in sorted/z-order) are evaluated per output block.

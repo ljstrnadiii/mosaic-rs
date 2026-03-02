@@ -1,8 +1,6 @@
 use std::convert::TryFrom;
 
-use warp_rs::{
-    Affine2D, CoordinateTransform, GridSpec, Resample, WarpWorkTile, plan_reproject_work,
-};
+use warp_rs::{Affine2D, GridSpec, WarpWorkTile};
 
 use crate::types::{BBox, GtiError, MosaicSpec, OutputWindow, Result};
 
@@ -11,8 +9,6 @@ use crate::types::{BBox, GtiError, MosaicSpec, OutputWindow, Result};
 pub struct DestinationContext {
     pub grid: GridSpec,
     pub window: OutputWindow,
-    #[allow(dead_code)]
-    pub dst_bbox: BBox,
     pub dst_bbox_4326: Option<BBox>,
 }
 
@@ -80,49 +76,8 @@ pub fn build_destination(spec: &MosaicSpec) -> Result<DestinationContext> {
     Ok(DestinationContext {
         grid,
         window,
-        dst_bbox,
         dst_bbox_4326,
     })
-}
-
-/// Work block description (row-major traversal).
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
-pub struct WorkBlock {
-    pub x: usize,
-    pub y: usize,
-    pub width: usize,
-    pub height: usize,
-}
-
-/// Partition the requested output window into blocks using row-major order.
-#[allow(dead_code)]
-pub fn plan_blocks(window: &OutputWindow, blockx: u32, blocky: u32) -> Vec<WorkBlock> {
-    let mut blocks = Vec::new();
-    let blockx = blockx.max(1) as usize;
-    let blocky = blocky.max(1) as usize;
-
-    let width = window.width as usize;
-    let height = window.height as usize;
-
-    let mut y = 0usize;
-    while y < height {
-        let h = blocky.min(height - y);
-        let mut x = 0usize;
-        while x < width {
-            let w = blockx.min(width - x);
-            blocks.push(WorkBlock {
-                x: x + window.x_off as usize,
-                y: y + window.y_off as usize,
-                width: w,
-                height: h,
-            });
-            x += blockx;
-        }
-        y += blocky;
-    }
-
-    blocks
 }
 
 /// Build a destination sub-grid for a given work tile (offsetting affine).
@@ -139,53 +94,6 @@ pub fn block_subgrid(dst_grid: &GridSpec, work: &WarpWorkTile) -> GridSpec {
     grid
 }
 
-/// Source tile geometry + transform from destination world coords into the tile's world coords.
-#[allow(dead_code)]
-pub struct TileGeometry {
-    pub src_grid: GridSpec,
-    pub dst_to_src: std::sync::Arc<dyn CoordinateTransform>,
-}
-
-/// Planned work entry tying a tile to a destination work tile.
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct PlannedTileWork {
-    pub tile_idx: usize,
-    pub work: WarpWorkTile,
-}
-
-/// Plan reproject work tiles for each source tile against the destination grid.
-///
-/// - Partitions the destination using `blockx/blocky`.
-/// - Uses `plan_reproject_work` to derive per-tile source windows.
-/// - Skips tiles/work where no source pixels are reachable (`src_window = None`).
-#[allow(dead_code)]
-pub fn plan_tile_reprojects(
-    dst: &DestinationContext,
-    tiles: &[TileGeometry],
-    blockx: u32,
-    blocky: u32,
-    resample: Resample,
-) -> Result<Vec<PlannedTileWork>> {
-    let mut out = Vec::new();
-    for (idx, tile) in tiles.iter().enumerate() {
-        let works = plan_reproject_work(
-            &tile.src_grid,
-            &dst.grid,
-            blockx as usize,
-            blocky as usize,
-            resample,
-            tile.dst_to_src.as_ref(),
-        )?;
-        for work in works.into_iter().filter(|w| w.src_window.is_some()) {
-            out.push(PlannedTileWork {
-                tile_idx: idx,
-                work,
-            });
-        }
-    }
-    Ok(out)
-}
 
 /// Compute the dst-space bbox for the current grid (after any window shift).
 fn window_bbox_dst(grid: &GridSpec) -> BBox {
@@ -273,27 +181,4 @@ mod tests {
         assert!((dst.grid.affine.f - 80.0).abs() < 1e-6);
     }
 
-    #[test]
-    fn planner_builds_tile_work_for_identity_transform() {
-        let spec = base_spec();
-        let dst = build_destination(&spec).unwrap();
-
-        let tile_geom = TileGeometry {
-            src_grid: dst.grid.clone(),
-            dst_to_src: std::sync::Arc::new(warp_rs::IdentityTransform),
-        };
-
-        let works = plan_tile_reprojects(
-            &dst,
-            &[tile_geom],
-            spec.blockxsize,
-            spec.blockysize,
-            spec.resampling,
-        )
-        .unwrap();
-
-        // Expect (100x100) / (64x64) rounded up → 4 work tiles for the single source tile.
-        assert_eq!(works.len(), 4);
-        assert!(works.iter().all(|w| w.work.src_window.is_some()));
-    }
 }

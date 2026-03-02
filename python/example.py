@@ -10,7 +10,7 @@ import rasterio
 from obstore.store import S3Store
 from rasterio.transform import from_origin
 
-from mosaic_index import (
+from mosaic_rs import (
     BBox,
     MosaicSpec,
     Resampling,

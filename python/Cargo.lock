@@ -1083,7 +1083,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "mosaic-index"
+name = "mosaic-rs"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1355,12 +1355,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "py-mosaic-index"
+name = "py-mosaic-rs"
 version = "0.1.0"
 dependencies = [
  "chrono",
  "geo",
- "mosaic-index",
+ "mosaic-rs",
  "pyo3",
  "pyo3-async-runtimes",
  "pyo3-object_store",

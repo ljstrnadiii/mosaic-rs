@@ -5,7 +5,7 @@ from functools import wraps
 from types import TracebackType
 from typing import Any
 
-from ._mosaic_index import (
+from ._mosaic_rs import (
     BBox,
     MosaicSpec,
     OutputWindow,
@@ -117,7 +117,7 @@ def init_tracing(*args: Any, **kwargs: Any) -> bool:
     Parameters
     ----------
     rust_log : str | None, default=None
-        Rust log filter (for example ``"mosaic=trace,mosaic_index=trace"``).
+        Rust log filter (for example ``"mosaic=trace,mosaic_rs=trace"``).
     perfetto_path : str | None, default=None
         Output file path for Perfetto-compatible JSON trace events.
     include_args : bool, default=False

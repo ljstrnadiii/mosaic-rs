@@ -1,6 +1,6 @@
-# mosaic-index
+# mosaic-rs
 
-`mosaic-index` is a Rust crate for building output mosaics from an indexed set of source GeoTIFF/COG 
+`mosaic-rs` is a Rust crate for building output mosaics from an indexed set of source GeoTIFF/COG 
 tiles with inspiration taken from GDAL's GTI driver.
 
 It combines:
@@ -40,7 +40,7 @@ pub async fn build_mosaic_async(
 ```rust
 use std::sync::Arc;
 
-use mosaic_index::{
+use mosaic_rs::{
     build_mosaic, BBox, BuildOptions, CacheConfig, DataType, MosaicSpec, Resample, WorkingType,
 };
 
@@ -79,7 +79,7 @@ let opts = BuildOptions {
 };
 
 let raster = build_mosaic(&spec, tiles, opts)?;
-# Ok::<(), mosaic_index::GtiError>(())
+# Ok::<(), mosaic_rs::GtiError>(())
 ```
 
 ## Build options and observability

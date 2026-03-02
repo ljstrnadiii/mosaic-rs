@@ -1,6 +1,6 @@
-# mosaic-index (Python)
+# mosaic-rs (Python)
 
-Python bindings for the Rust `mosaic-index` crate.
+Python bindings for the Rust `mosaic-rs` crate.
 
 ## Local development
 
@@ -44,7 +44,7 @@ Use Rust tracing to get logs and a Perfetto-compatible trace file.
 
 ```bash
 cd python
-RUST_LOG="mosaic=trace,mosaic_index=trace,async_tiff=trace" \
+RUST_LOG="mosaic=trace,mosaic_rs=trace,async_tiff=trace" \
 MOSAIC_PERFETTO_TRACE="/tmp/mosaic-trace.json" \
 python example.py
 ```
@@ -56,10 +56,10 @@ python example.py
 
 - `RUST_LOG`: Controls Rust log verbosity (`info`, `debug`, `trace`) and per-target filters.
   Recommended for profiling:
-  `mosaic=trace,mosaic_index=trace,async_tiff=trace`
+  `mosaic=trace,mosaic_rs=trace,async_tiff=trace`
 - `MOSAIC_PERFETTO_TRACE`: Output path for trace events to load in Perfetto.
 - If `MOSAIC_PERFETTO_TRACE` is set and `RUST_LOG` is not set, the library now defaults to:
-  `mosaic=trace,mosaic_index=trace,async_tiff=trace,info`
+  `mosaic=trace,mosaic_rs=trace,async_tiff=trace,info`
   so Perfetto includes span-level timing by default.
 
 ### Programmatic API
@@ -67,10 +67,10 @@ python example.py
 Use the context manager to auto-flush and finalize traces:
 
 ```python
-from mosaic_index import TracingSession
+from mosaic_rs import TracingSession
 
 with TracingSession(
-    rust_log="mosaic=trace,mosaic_index=trace,async_tiff=trace",
+    rust_log="mosaic=trace,mosaic_rs=trace,async_tiff=trace",
     perfetto_path="/tmp/mosaic-trace.json",
 ):
     # ... run build_mosaic/build_mosaic_async ...

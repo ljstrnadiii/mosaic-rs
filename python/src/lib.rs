@@ -2,7 +2,7 @@
 
 use chrono::{DateTime, FixedOffset, Utc};
 use geo::{LineString, MultiPolygon, Polygon};
-use mosaic_index::{
+use mosaic_rs::{
     BBox, BuildOptions, CacheConfig, DataType, GtiError, MosaicSpec, OutputWindow, RasterOwned,
     Resample, SortValue, TileRecord, WorkingType, build_mosaic, build_mosaic_async,
 };
@@ -22,7 +22,7 @@ const DEFAULT_PIXEL_CACHE_BYTES: usize = 2 * 1024 * 1024 * 1024;
 static TRACING_INITIALIZED: OnceLock<()> = OnceLock::new();
 static TRACE_GUARD: OnceLock<Mutex<Option<tracing_chrome::FlushGuard>>> = OnceLock::new();
 
-#[pyclass(name = "BBox", module = "mosaic_index")]
+#[pyclass(name = "BBox", module = "mosaic_rs")]
 #[derive(Clone, Copy, Debug)]
 struct PyBBox {
     minx: f64,
@@ -70,7 +70,7 @@ impl From<PyBBox> for BBox {
     }
 }
 
-#[pyclass(name = "OutputWindow", module = "mosaic_index")]
+#[pyclass(name = "OutputWindow", module = "mosaic_rs")]
 #[derive(Clone, Copy, Debug)]
 struct PyOutputWindow {
     x_off: u32,
@@ -118,7 +118,7 @@ impl From<PyOutputWindow> for OutputWindow {
     }
 }
 
-#[pyclass(name = "MosaicSpec", module = "mosaic_index")]
+#[pyclass(name = "MosaicSpec", module = "mosaic_rs")]
 #[derive(Clone)]
 struct PyMosaicSpec {
     inner: MosaicSpec,
@@ -176,7 +176,7 @@ impl PyMosaicSpec {
     }
 }
 
-#[pyclass(name = "TileRecord", module = "mosaic_index")]
+#[pyclass(name = "TileRecord", module = "mosaic_rs")]
 #[derive(Clone)]
 struct PyTileRecord {
     inner: TileRecord,
@@ -212,7 +212,7 @@ impl PyTileRecord {
     }
 }
 
-#[pyclass(name = "Raster", module = "mosaic_index", frozen)]
+#[pyclass(name = "Raster", module = "mosaic_rs", frozen)]
 struct PyRaster {
     width: usize,
     height: usize,
@@ -435,7 +435,7 @@ fn init_tracing_py(
 
     let default_directives = if perfetto_path.is_some() {
         // Perfetto timelines are most useful when span-level tracing is enabled.
-        "mosaic=trace,mosaic_index=trace,async_tiff=trace,info"
+        "mosaic=trace,mosaic_rs=trace,async_tiff=trace,info"
     } else {
         "info"
     };
@@ -664,13 +664,13 @@ fn parse_resample(value: Option<&Bound<'_, PyAny>>) -> PyResult<Resample> {
         .and_then(|m| m.getattr("Enum"))?;
     if !value.is_instance(&enum_cls)? {
         return Err(PyValueError::new_err(
-            "unsupported resampling. Expected a mosaic_index.Resampling enum member (e.g. Resampling.NEAREST)",
+            "unsupported resampling. Expected a mosaic_rs.Resampling enum member (e.g. Resampling.NEAREST)",
         ));
     }
 
     let Ok(name) = value.getattr("value").and_then(|v| v.extract::<String>()) else {
         return Err(PyValueError::new_err(
-            "unsupported resampling. Could not read enum value. Expected a mosaic_index.Resampling enum member (e.g. Resampling.NEAREST)",
+            "unsupported resampling. Could not read enum value. Expected a mosaic_rs.Resampling enum member (e.g. Resampling.NEAREST)",
         ));
     };
 
@@ -885,7 +885,7 @@ fn to_py_err(err: GtiError) -> PyErr {
 }
 
 #[pymodule]
-fn _mosaic_index(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _mosaic_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(___version))?;
     m.add_wrapped(wrap_pyfunction!(init_tracing_py))?;
     m.add_wrapped(wrap_pyfunction!(flush_tracing_py))?;
@@ -899,7 +899,7 @@ fn _mosaic_index(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTileRecord>()?;
     m.add_class::<PyRaster>()?;
 
-    pyo3_object_store::register_exceptions_module(py, m, "mosaic_index", "exceptions")?;
+    pyo3_object_store::register_exceptions_module(py, m, "mosaic_rs", "exceptions")?;
 
     Ok(())
 }

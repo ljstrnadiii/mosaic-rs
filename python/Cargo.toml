@@ -1,12 +1,12 @@
 [package]
-name = "py-mosaic-index"
+name = "py-mosaic-rs"
 version = "0.1.0"
 edition = "2024"
-description = "Python bindings for mosaic-index"
+description = "Python bindings for mosaic-rs"
 license = "MIT OR Apache-2.0"
 
 [lib]
-name = "_mosaic_index"
+name = "_mosaic_rs"
 crate-type = ["cdylib"]
 
 [features]
@@ -16,7 +16,7 @@ abi3-py311 = ["pyo3/abi3-py311"]
 [dependencies]
 chrono = "0.4"
 geo = "0.28"
-mosaic-index = { path = "..", features = ["perfetto"] }
+mosaic-rs = { path = "..", features = ["perfetto"] }
 pyo3 = { version = "0.27", features = ["macros", "chrono"] }
 pyo3-async-runtimes = "0.27"
 pyo3-object_store = "0.8.0"

@@ -3,9 +3,9 @@ requires = ["maturin>=1.4.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "mosaic-index"
+name = "mosaic-rs"
 requires-python = ">=3.10"
-description = "Python bindings for the mosaic-index Rust crate"
+description = "Python bindings for the mosaic-rs Rust crate"
 readme = "README.md"
 dependencies = ["obstore>=0.8.2"]
 dynamic = ["version"]
@@ -26,5 +26,5 @@ dev = [
 [tool.maturin]
 bindings = "pyo3"
 features = ["pyo3/extension-module"]
-module-name = "mosaic_index._mosaic_index"
+module-name = "mosaic_rs._mosaic_rs"
 python-source = "python"

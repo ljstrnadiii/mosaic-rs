@@ -107,7 +107,7 @@ wheels = [
 ]
 
 [[package]]
-name = "mosaic-index"
+name = "mosaic-rs"
 source = { editable = "." }
 dependencies = [
     { name = "obstore" },
